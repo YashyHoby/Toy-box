@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Mochi Seal 3D Interaction</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #87CEEB; /* 空の色 */
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            touch-action: none;
+        }
+        #ui-layer {
+            position: absolute;
+            bottom: 20px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            pointer-events: none;
+            color: white;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        .instruction {
+            background: rgba(0, 0, 0, 0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            display: inline-block;
+            font-size: 14px;
+            margin: 0 5px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="canvas-container"></div>
+<div id="ui-layer">
+    <div class="instruction">顔・鼻・ベロをドラッグ: もちもち伸びる</div>
+    <div class="instruction">ベロ: 引っ張って離すと回転</div>
+    <div class="instruction">背景: 視線追従 / スワイプで回転</div>
+</div>
+
+<!-- Three.js Library -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<script>
+/**
+ * 設定パラメータ
+ */
+const CONFIG = {
+    color: {
+        body: 0x8FA4B5,      // アザラシのグレーブルー
+        spot: 0x4A5A69,      // 斑点の色
+        belly: 0xE0E8F0,     // お腹の白っぽい色
+        eyeWhite: 0xFFFFFF,
+        pupil: 0x111111,
+        nose: 0x222222,
+        tongue: 0xFF8888
+    },
+    physics: {
+        springStrength: 0.08, // バネ係数
+        damping: 0.85,        // 減衰率
+        radius: 4.5,          // 顔ドラッグの影響範囲
+        maxDeformation: 3.0   // 顔の最大変形量
+    },
+    interaction: {
+        spinThreshold: 8.0,   // 回転判定の閾値
+        friction: 0.96,       // 回転の摩擦
+        recoilFactor: 2.0     // ベロ反動の強さ
+    }
+};
+
+// グローバル変数
+let scene, camera, renderer;
+let sealGroup, bodyMesh, snoutGroup;
+let eyes = { left: null, right: null };
+let pupils = { left: null, right: null };
+let tongue;
+let originalPositions = [];
+let velocities = [];
+
+// パーツ追従用の変数
+let faceCenterIndices = []; 
+let partsInitialPos = {
+    eyesLeft: new THREE.Vector3(),
+    eyesRight: new THREE.Vector3(),
+    snout: new THREE.Vector3(),
+    tongue: new THREE.Vector3() 
+};
+
+// インタラクション状態
+let isDraggingFace = false;
+let isDraggingTongue = false; 
+let isHoldingBg = false;
+let dragPoint = new THREE.Vector3(); 
+let raycaster = new THREE.Raycaster();
+let mouse = new THREE.Vector2();
+
+let lastMousePos = new THREE.Vector2();
+let dragVelocity = new THREE.Vector2();
+let spinVelocity = 0;
+let isSpinning = false;
+let tongueAnimState = 0; // 0: idle, 1: lick out, 2: in
+
+// ベロ物理用 
+let tongueTipPos = new THREE.Vector3();      
+let tongueTipVelocity = new THREE.Vector3(); 
+const TONGUE_BASE_LEN = 0.44; 
+
+/**
+ * 初期化処理
+ */
+function init() {
+    const container = document.getElementById('canvas-container');
+
+    // シーン設定
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87CEEB);
+    scene.fog = new THREE.Fog(0x87CEEB, 8, 20);
+
+    // カメラ設定
+    camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+    camera.position.set(0, 0, 8.5); 
+
+    // レンダラー設定
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    container.appendChild(renderer.domElement);
+
+    // ライティング
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); 
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    dirLight.position.set(5, 8, 7);
+    dirLight.castShadow = true;
+    dirLight.shadow.bias = -0.001;
+    dirLight.shadow.mapSize.width = 1024;
+    dirLight.shadow.mapSize.height = 1024;
+    scene.add(dirLight);
+
+    const backLight = new THREE.DirectionalLight(0xffffff, 0.4);
+    backLight.position.set(-5, 2, -5);
+    scene.add(backLight);
+
+    // アザラシ作成
+    createSeal();
+
+    // イベントリスナー
+    window.addEventListener('resize', onWindowResize);
+    
+    const canvas = renderer.domElement;
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerUp);
+
+    // ループ開始
+    animate();
+}
+
+/**
+ * アザラシのモデル生成
+ */
+function createSeal() {
+    sealGroup = new THREE.Group();
+    scene.add(sealGroup);
+
+    // 1. 体
+    const bodyGeo = new THREE.SphereGeometry(2.5, 128, 128);
+    const bodyMat = new THREE.MeshStandardMaterial({
+        color: CONFIG.color.body,
+        roughness: 0.7, 
+        metalness: 0.1,  
+    });
+    bodyGeo.scale(1.1, 1.0, 1.0); 
+
+    bodyMesh = new THREE.Mesh(bodyGeo, bodyMat);
+    bodyMesh.castShadow = true;
+    bodyMesh.receiveShadow = true;
+    bodyMesh.userData = { isFace: true };
+    sealGroup.add(bodyMesh);
+
+    // 物理演算データ初期化
+    const posAttribute = bodyGeo.attributes.position;
+    const vertex = new THREE.Vector3();
+    
+    for (let i = 0; i < posAttribute.count; i++) {
+        vertex.set(posAttribute.getX(i), posAttribute.getY(i), posAttribute.getZ(i));
+        originalPositions.push(vertex.clone());
+        velocities.push(new THREE.Vector3(0, 0, 0));
+
+        // 追従用インデックス
+        if (vertex.z > 2.0 && Math.abs(vertex.x) < 0.8 && Math.abs(vertex.y) < 0.8) {
+            faceCenterIndices.push(i);
+        }
+    }
+
+    // 2. 目
+    const eyeGeo = new THREE.SphereGeometry(0.7, 32, 32);
+    eyeGeo.scale(1, 1, 0.6); 
+    const eyeMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.eyeWhite });
+
+    eyes.left = new THREE.Mesh(eyeGeo, eyeMat);
+    eyes.left.position.set(-0.85, 0.4, 2.05);
+    sealGroup.add(eyes.left);
+
+    eyes.right = new THREE.Mesh(eyeGeo, eyeMat);
+    eyes.right.position.set(0.85, 0.4, 2.05);
+    sealGroup.add(eyes.right);
+
+    // 3. 瞳孔
+    const pupilGeo = new THREE.SphereGeometry(0.19, 16, 16);
+    pupilGeo.scale(1, 1, 0.3);
+    const pupilMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.pupil });
+
+    pupils.left = new THREE.Mesh(pupilGeo, pupilMat);
+    pupils.left.position.set(0, 0, 0.65);
+    eyes.left.add(pupils.left);
+
+    pupils.right = new THREE.Mesh(pupilGeo, pupilMat);
+    pupils.right.position.set(0, 0, 0.65);
+    eyes.right.add(pupils.right);
+
+    // 4. マズルと鼻
+    snoutGroup = new THREE.Group();
+    sealGroup.add(snoutGroup);
+    
+    const muzzleGeo = new THREE.SphereGeometry(0.5, 32, 32);
+    muzzleGeo.scale(1.2, 0.8, 0.5);
+    const muzzleMat = new THREE.MeshStandardMaterial({ 
+        color: 0xEEEEEE, 
+        roughness: 0.9,
+        metalness: 0.0
+    });
+    
+    const muzzleLeft = new THREE.Mesh(muzzleGeo, muzzleMat);
+    muzzleLeft.position.set(-0.35, -0.3, 2.4);
+    muzzleLeft.rotation.set(0, -0.2, 0.2);
+    snoutGroup.add(muzzleLeft);
+
+    const muzzleRight = new THREE.Mesh(muzzleGeo, muzzleMat);
+    muzzleRight.position.set(0.35, -0.3, 2.4);
+    muzzleRight.rotation.set(0, 0.2, -0.2);
+    snoutGroup.add(muzzleRight);
+
+    // 鼻
+    const noseGeo = new THREE.SphereGeometry(0.2, 32, 32);
+    noseGeo.scale(1, 0.7, 1);
+    const noseMat = new THREE.MeshStandardMaterial({ 
+        color: CONFIG.color.nose, 
+        roughness: 0.5,
+        metalness: 0.0
+    });
+    const nose = new THREE.Mesh(noseGeo, noseMat);
+    nose.position.set(0, -0.1, 2.65);
+    nose.rotation.x = 0.2;
+    nose.userData = { isFace: true }; 
+    snoutGroup.add(nose);
+
+    // 5. ヒゲ
+    const whiskerMat = new THREE.LineBasicMaterial({ color: 0x333333 });
+    const whiskerGeo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(0, 0, 0),
+        new THREE.Vector3(0.8, 0, 0)
+    ]);
+    const addWhisker = (x, y, z, rz, ry) => {
+        const whisker = new THREE.Line(whiskerGeo, whiskerMat);
+        whisker.position.set(x, y, z);
+        whisker.rotation.z = rz;
+        whisker.rotation.y = ry;
+        snoutGroup.add(whisker);
+    };
+    addWhisker(0.6, -0.3, 2.5, 0.1, 0.3);
+    addWhisker(0.65, -0.4, 2.45, 0.0, 0.3);
+    addWhisker(-0.6, -0.3, 2.5, 3.0, -0.3);
+    addWhisker(-0.65, -0.4, 2.45, 3.1, -0.3);
+
+    // 6. 舌
+    const tongueRadius = 0.22;
+    const tongueGeo = new THREE.SphereGeometry(tongueRadius, 16, 16);
+    tongueGeo.scale(1, 0.4, 1.0); 
+    // ジオメトリ原点を根元にするためZ移動
+    tongueGeo.translate(0, 0, tongueRadius);
+
+    const tongueMat = new THREE.MeshStandardMaterial({ 
+        color: CONFIG.color.tongue,
+        roughness: 0.4,
+        metalness: 0.0
+    });
+    tongue = new THREE.Mesh(tongueGeo, tongueMat);
+    tongue.position.set(0, -0.65, 2.25); 
+    tongue.userData = { isTongue: true };
+    tongue.visible = true; 
+    sealGroup.add(tongue);
+
+    // 7. 斑点
+    const spotGeo = new THREE.CircleGeometry(0.15, 16);
+    const spotMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.spot, side: THREE.DoubleSide });
+    const addSpot = (theta, phi, scale) => {
+        const spot = new THREE.Mesh(spotGeo, spotMat);
+        const r = 2.51; 
+        spot.position.x = r * Math.sin(phi) * Math.cos(theta);
+        spot.position.y = r * Math.cos(phi) * 0.9;
+        spot.position.z = r * Math.sin(phi) * Math.sin(theta);
+        spot.lookAt(0, spot.position.y, 0);
+        spot.scale.set(scale, scale, 1);
+        sealGroup.add(spot);
+    };
+    addSpot(1.0, 1.2, 1.0);
+    addSpot(-1.2, 1.0, 1.2);
+    addSpot(2.5, 1.5, 0.8);
+    addSpot(-2.0, 0.8, 1.1);
+    addSpot(0.5, 0.5, 0.7);
+
+    // 初期位置保存
+    partsInitialPos.eyesLeft.copy(eyes.left.position);
+    partsInitialPos.eyesRight.copy(eyes.right.position);
+    partsInitialPos.snout.copy(snoutGroup.position);
+    partsInitialPos.tongue.copy(tongue.position);
+    
+    const initialDir = new THREE.Vector3(0, -0.2, 1).normalize(); 
+    const initialLen = 0.2; 
+    tongueTipPos.copy(partsInitialPos.tongue).add(initialDir.multiplyScalar(initialLen));
+}
+
+/**
+ * アニメーションループ
+ */
+function animate() {
+    requestAnimationFrame(animate);
+    const time = Date.now() * 0.001;
+
+    // --- 1. 顔の物理演算 ---
+    let localDragPoint = null;
+    if (isDraggingFace) {
+        localDragPoint = dragPoint.clone().applyMatrix4(bodyMesh.matrixWorld.invert());
+    }
+
+    const positionAttribute = bodyMesh.geometry.attributes.position;
+    let needsUpdate = false;
+    let faceDeformation = new THREE.Vector3(0, 0, 0);
+    let deformationCount = 0;
+
+    for (let i = 0; i < originalPositions.length; i++) {
+        const original = originalPositions[i];
+        const current = new THREE.Vector3(
+            positionAttribute.getX(i),
+            positionAttribute.getY(i),
+            positionAttribute.getZ(i)
+        );
+
+        let force = new THREE.Vector3(0, 0, 0);
+        
+        const displacement = new THREE.Vector3().subVectors(original, current);
+        force.add(displacement.multiplyScalar(CONFIG.physics.springStrength));
+
+        if (isDraggingFace && !isDraggingTongue && localDragPoint) {
+            const dist = original.distanceTo(localDragPoint);
+            if (dist < CONFIG.physics.radius) {
+                const t = dist / CONFIG.physics.radius;
+                const influence = (Math.cos(t * Math.PI) + 1.0) * 0.5;
+                const pullStrength = 0.06; 
+                const pull = new THREE.Vector3().subVectors(localDragPoint, original).multiplyScalar(influence * pullStrength);
+                force.add(pull);
+            }
+        }
+
+        velocities[i].add(force);
+        velocities[i].multiplyScalar(CONFIG.physics.damping);
+        current.add(velocities[i]);
+
+        const diff = new THREE.Vector3().subVectors(current, original);
+        if (diff.length() > CONFIG.physics.maxDeformation) {
+            diff.normalize().multiplyScalar(CONFIG.physics.maxDeformation);
+            current.lerp(original.clone().add(diff), 0.2);
+            velocities[i].multiplyScalar(0.5);
+        }
+
+        positionAttribute.setXYZ(i, current.x, current.y, current.z);
+        if (velocities[i].lengthSq() > 0.0001) needsUpdate = true;
+    }
+
+    if (needsUpdate || isDraggingFace) {
+        positionAttribute.needsUpdate = true;
+        bodyMesh.geometry.computeVertexNormals();
+    }
+
+    // --- 2. パーツ追従 ---
+    for (let idx of faceCenterIndices) {
+        const original = originalPositions[idx];
+        const currentX = positionAttribute.getX(idx);
+        const currentY = positionAttribute.getY(idx);
+        const currentZ = positionAttribute.getZ(idx);
+        faceDeformation.x += currentX - original.x;
+        faceDeformation.y += currentY - original.y;
+        faceDeformation.z += currentZ - original.z;
+        deformationCount++;
+    }
+    if (deformationCount > 0) faceDeformation.divideScalar(deformationCount);
+
+    eyes.left.position.copy(partsInitialPos.eyesLeft).add(faceDeformation);
+    eyes.right.position.copy(partsInitialPos.eyesRight).add(faceDeformation);
+    snoutGroup.position.copy(partsInitialPos.snout).add(faceDeformation);
+
+    // --- 3. ベロの物理演算 ---
+    const tongueRootPos = partsInitialPos.tongue.clone().add(faceDeformation);
+    let targetTipPos = new THREE.Vector3();
+    const restDir = new THREE.Vector3(0, -0.2, 1).normalize(); 
+    
+    if (isDraggingTongue) {
+        // ドラッグ中 (Local近似)
+        let localDrag = dragPoint.clone().applyMatrix4(sealGroup.matrixWorld.invert());
+        targetTipPos.copy(localDrag);
+
+        // 長さ制限
+        const dist = targetTipPos.distanceTo(tongueRootPos);
+        const maxLen = 3.5; // 少し長く伸ばせるようにする
+        if (dist > maxLen) {
+            const dir = new THREE.Vector3().subVectors(targetTipPos, tongueRootPos).normalize();
+            targetTipPos.copy(tongueRootPos).add(dir.multiplyScalar(maxLen));
+        }
+        tongueTipPos.lerp(targetTipPos, 0.2);
+        tongueTipVelocity.set(0, 0, 0);
+
+    } else {
+        // アイドル/アニメーション
+        let targetLen = 0.15; 
+        if (tongueAnimState === 0 && Math.random() < 0.005 && !isSpinning && !isHoldingBg) {
+            tongueAnimState = 1; 
+        }
+
+        if (tongueAnimState === 1) { 
+            targetLen = 0.6; 
+            const currentLen = tongueTipPos.distanceTo(tongueRootPos);
+            if (currentLen > 0.55) tongueAnimState = 2;
+        } else if (tongueAnimState === 2) { 
+            targetLen = 0.15;
+            const currentLen = tongueTipPos.distanceTo(tongueRootPos);
+            if (currentLen < 0.2) tongueAnimState = 0;
+        }
+
+        targetTipPos.copy(tongueRootPos).add(restDir.multiplyScalar(targetLen));
+
+        // バネ物理
+        const force = new THREE.Vector3().subVectors(targetTipPos, tongueTipPos).multiplyScalar(0.15);
+        tongueTipVelocity.add(force);
+        tongueTipVelocity.multiplyScalar(0.75); 
+        tongueTipPos.add(tongueTipVelocity);
+    }
+
+    // ベロのメッシュ適用
+    tongue.position.copy(tongueRootPos);
+    tongue.lookAt(tongueTipPos);
+
+    const currentDist = tongueRootPos.distanceTo(tongueTipPos);
+    const scaleZ = Math.max(0.01, currentDist / TONGUE_BASE_LEN);
+    const thinning = Math.max(0.6, 1.0 - (scaleZ - 1.0) * 0.1); 
+    tongue.scale.set(thinning, 0.4 * thinning, scaleZ);
+
+
+    // --- 4. 回転と視線 ---
+    if (isSpinning) {
+        sealGroup.rotation.y += spinVelocity;
+        spinVelocity *= CONFIG.interaction.friction;
+        if (Math.abs(spinVelocity) < 0.005) {
+            isSpinning = false;
+            spinVelocity = 0;
+        }
+    } else if (!isDraggingFace && !isDraggingTongue) {
+        sealGroup.rotation.y += (0 - sealGroup.rotation.y) * 0.05;
+    }
+
+    // 視線
+    const isFastSpinning = Math.abs(spinVelocity) > 0.3;
+    if (isFastSpinning) {
+        pupils.left.position.set(0.3, Math.sin(time * 20) * 0.2, 0.65);
+        pupils.right.position.set(-0.3, -Math.sin(time * 20) * 0.2, 0.65);
+    } else {
+        let targetX = 0;
+        let targetY = 0;
+        if (isDraggingFace || isDraggingTongue || isHoldingBg) {
+            targetX = mouse.x * 0.4;
+            targetY = mouse.y * 0.4;
+        }
+        pupils.left.position.x += (targetX - pupils.left.position.x) * 0.2;
+        pupils.left.position.y += (targetY - pupils.left.position.y) * 0.2;
+        pupils.right.position.x += (targetX - pupils.right.position.x) * 0.2;
+        pupils.right.position.y += (targetY - pupils.right.position.y) * 0.2;
+    }
+
+    renderer.render(scene, camera);
+}
+
+/**
+ * イベントハンドラ
+ */
+function onPointerDown(event) {
+    updateMouse(event);
+    lastMousePos.set(event.clientX, event.clientY);
+    dragVelocity.set(0, 0);
+
+    raycaster.setFromCamera(mouse, camera);
+    const intersects = raycaster.intersectObjects(scene.children, true);
+    
+    const hitTongue = intersects.find(hit => hit.object.userData.isTongue);
+    const hitFace = intersects.find(hit => hit.object.userData.isFace);
+
+    if (hitTongue) {
+        isDraggingTongue = true;
+        isDraggingFace = false;
+        dragPoint.copy(hitTongue.point);
+    } else if (hitFace) {
+        isDraggingFace = true;
+        isDraggingTongue = false;
+        dragPoint.copy(hitFace.point);
+    } else {
+        isHoldingBg = true;
+        spinVelocity = 0;
+        isSpinning = false;
+    }
+}
+
+function onPointerMove(event) {
+    updateMouse(event);
+    const currentPos = new THREE.Vector2(event.clientX, event.clientY);
+    dragVelocity.subVectors(currentPos, lastMousePos);
+    lastMousePos.copy(currentPos);
+
+    if (isDraggingFace || isDraggingTongue) {
+        raycaster.setFromCamera(mouse, camera);
+        
+        const targetZ = 2.5; 
+        const vec = new THREE.Vector3();
+        vec.set(mouse.x, mouse.y, 0.5);
+        vec.unproject(camera);
+        vec.sub(camera.position).normalize();
+        const distance = (targetZ - camera.position.z) / vec.z;
+        const pos = new THREE.Vector3().copy(camera.position).add(vec.multiplyScalar(distance));
+        
+        dragPoint.copy(pos);
+    }
+}
+
+function onPointerUp(event) {
+    if (isDraggingTongue) {
+        // ベロの反動計算
+        // 現在のベロの根元(Root)は animate() で計算されているが
+        // ここでは tongue.position が最新の根元位置を保持している
+        
+        // 根元から先端(ドラッグ位置)へのベクトル
+        // ローカル空間での簡易計算
+        const dx = tongueTipPos.x - tongue.position.x;
+        
+        // 横方向へある程度引っ張っていたら回転させる
+        if (Math.abs(dx) > 0.3) {
+            // 反動なので、引っ張った方向と逆回転（またはスナップバックの勢い）
+            // 右(+x)に引っ張って離すと、ベロは左に戻る力が発生 -> 左向きの力
+            // 左向きの力が顔の前方にかかると、上から見て反時計回り(positive Y rotation)？
+            // 物理的な厳密さより「気持ちよさ」重視で、逆方向へ回転させる
+            // dxがプラス（右）なら、spinVelocityをマイナス（右回転）させると
+            // 引っ張った手を離した瞬間に「ブルンッ」と戻るような動きになる
+            
+            spinVelocity = -dx * CONFIG.interaction.recoilFactor;
+            isSpinning = true;
+        }
+    }
+
+    isDraggingFace = false;
+    isDraggingTongue = false;
+
+    if (isHoldingBg) {
+        isHoldingBg = false;
+        if (Math.abs(dragVelocity.x) > CONFIG.interaction.spinThreshold) {
+            isSpinning = true;
+            spinVelocity = Math.max(Math.min(dragVelocity.x * 0.01, 0.5), -0.5);
+        }
+    }
+}
+
+function updateMouse(event) {
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// 実行
+init();
+
+</script>
+</body>
+</html>
