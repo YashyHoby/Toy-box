@@ -43,8 +43,7 @@
 <div id="canvas-container"></div>
 <div id="ui-layer">
     <div class="instruction">顔・鼻・ベロをドラッグ: もちもち伸びる</div>
-    <div class="instruction">ベロ: 引っ張って離すと回転</div>
-    <div class="instruction">背景: 視線追従 / スワイプで回転</div>
+    <div class="instruction">ベロ/背景: 引っ張って離すと360度回転</div>
 </div>
 
 <!-- Three.js Library -->
@@ -57,7 +56,6 @@
 const CONFIG = {
     color: {
         body: 0x8FA4B5,      // アザラシのグレーブルー
-        spot: 0x4A5A69,      // 斑点の色
         belly: 0xE0E8F0,     // お腹の白っぽい色
         eyeWhite: 0xFFFFFF,
         pupil: 0x111111,
@@ -65,15 +63,16 @@ const CONFIG = {
         tongue: 0xFF8888
     },
     physics: {
-        springStrength: 0.08, // バネ係数
-        damping: 0.85,        // 減衰率
-        radius: 4.5,          // 顔ドラッグの影響範囲
-        maxDeformation: 3.0   // 顔の最大変形量
+        springStrength: 0.08, 
+        damping: 0.85,        
+        radius: 4.5,          
+        maxDeformation: 3.0   
     },
     interaction: {
-        spinThreshold: 8.0,   // 回転判定の閾値
-        friction: 0.96,       // 回転の摩擦
-        recoilFactor: 2.0     // ベロ反動の強さ
+        spinThreshold: 5.0,   // 回転判定の閾値
+        friction: 0.97,       // 回転の摩擦
+        recoilFactor: 1.5,    // ベロ反動の強さ (4.0 -> 1.5 に弱めました)
+        recoverySpeed: 0.05   // 正面に戻る速さ
     }
 };
 
@@ -105,11 +104,12 @@ let mouse = new THREE.Vector2();
 
 let lastMousePos = new THREE.Vector2();
 let dragVelocity = new THREE.Vector2();
-let spinVelocity = 0;
-let isSpinning = false;
-let tongueAnimState = 0; // 0: idle, 1: lick out, 2: in
 
-// ベロ物理用 
+// 回転制御 (Quaternionベース)
+let spinVelocity = new THREE.Vector3(0, 0, 0); 
+let isSpinning = false;
+
+let tongueAnimState = 0; 
 let tongueTipPos = new THREE.Vector3();      
 let tongueTipVelocity = new THREE.Vector3(); 
 const TONGUE_BASE_LEN = 0.44; 
@@ -125,17 +125,14 @@ function init() {
     scene.background = new THREE.Color(0x87CEEB);
     scene.fog = new THREE.Fog(0x87CEEB, 8, 20);
 
-    // カメラ設定
     camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
     camera.position.set(0, 0, 8.5); 
 
-    // レンダラー設定
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.shadowMap.enabled = true;
     container.appendChild(renderer.domElement);
 
-    // ライティング
     const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); 
     scene.add(ambientLight);
 
@@ -151,10 +148,8 @@ function init() {
     backLight.position.set(-5, 2, -5);
     scene.add(backLight);
 
-    // アザラシ作成
     createSeal();
 
-    // イベントリスナー
     window.addEventListener('resize', onWindowResize);
     
     const canvas = renderer.domElement;
@@ -163,7 +158,6 @@ function init() {
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('pointerleave', onPointerUp);
 
-    // ループ開始
     animate();
 }
 
@@ -189,7 +183,6 @@ function createSeal() {
     bodyMesh.userData = { isFace: true };
     sealGroup.add(bodyMesh);
 
-    // 物理演算データ初期化
     const posAttribute = bodyGeo.attributes.position;
     const vertex = new THREE.Vector3();
     
@@ -198,7 +191,6 @@ function createSeal() {
         originalPositions.push(vertex.clone());
         velocities.push(new THREE.Vector3(0, 0, 0));
 
-        // 追従用インデックス
         if (vertex.z > 2.0 && Math.abs(vertex.x) < 0.8 && Math.abs(vertex.y) < 0.8) {
             faceCenterIndices.push(i);
         }
@@ -288,7 +280,6 @@ function createSeal() {
     const tongueRadius = 0.22;
     const tongueGeo = new THREE.SphereGeometry(tongueRadius, 16, 16);
     tongueGeo.scale(1, 0.4, 1.0); 
-    // ジオメトリ原点を根元にするためZ移動
     tongueGeo.translate(0, 0, tongueRadius);
 
     const tongueMat = new THREE.MeshStandardMaterial({ 
@@ -302,26 +293,8 @@ function createSeal() {
     tongue.visible = true; 
     sealGroup.add(tongue);
 
-    // 7. 斑点
-    const spotGeo = new THREE.CircleGeometry(0.15, 16);
-    const spotMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.spot, side: THREE.DoubleSide });
-    const addSpot = (theta, phi, scale) => {
-        const spot = new THREE.Mesh(spotGeo, spotMat);
-        const r = 2.51; 
-        spot.position.x = r * Math.sin(phi) * Math.cos(theta);
-        spot.position.y = r * Math.cos(phi) * 0.9;
-        spot.position.z = r * Math.sin(phi) * Math.sin(theta);
-        spot.lookAt(0, spot.position.y, 0);
-        spot.scale.set(scale, scale, 1);
-        sealGroup.add(spot);
-    };
-    addSpot(1.0, 1.2, 1.0);
-    addSpot(-1.2, 1.0, 1.2);
-    addSpot(2.5, 1.5, 0.8);
-    addSpot(-2.0, 0.8, 1.1);
-    addSpot(0.5, 0.5, 0.7);
+    // 斑点生成コードを削除しました
 
-    // 初期位置保存
     partsInitialPos.eyesLeft.copy(eyes.left.position);
     partsInitialPos.eyesRight.copy(eyes.right.position);
     partsInitialPos.snout.copy(snoutGroup.position);
@@ -411,19 +384,43 @@ function animate() {
     eyes.right.position.copy(partsInitialPos.eyesRight).add(faceDeformation);
     snoutGroup.position.copy(partsInitialPos.snout).add(faceDeformation);
 
-    // --- 3. ベロの物理演算 ---
+
+    // --- 3. 360度回転処理 ---
+    const speed = spinVelocity.length();
+    
+    if (speed > 0.001) {
+        isSpinning = true;
+        
+        const axis = spinVelocity.clone().normalize();
+        const angle = speed;
+        
+        const deltaQ = new THREE.Quaternion();
+        deltaQ.setFromAxisAngle(axis, angle);
+        
+        sealGroup.quaternion.premultiply(deltaQ);
+        spinVelocity.multiplyScalar(CONFIG.interaction.friction);
+        
+    } else {
+        isSpinning = false;
+        
+        if (!isDraggingFace && !isDraggingTongue && !isHoldingBg) {
+            const targetQ = new THREE.Quaternion(); 
+            sealGroup.quaternion.slerp(targetQ, CONFIG.interaction.recoverySpeed);
+        }
+    }
+
+
+    // --- 4. ベロの物理演算 ---
     const tongueRootPos = partsInitialPos.tongue.clone().add(faceDeformation);
     let targetTipPos = new THREE.Vector3();
     const restDir = new THREE.Vector3(0, -0.2, 1).normalize(); 
     
     if (isDraggingTongue) {
-        // ドラッグ中 (Local近似)
         let localDrag = dragPoint.clone().applyMatrix4(sealGroup.matrixWorld.invert());
         targetTipPos.copy(localDrag);
 
-        // 長さ制限
         const dist = targetTipPos.distanceTo(tongueRootPos);
-        const maxLen = 3.5; // 少し長く伸ばせるようにする
+        const maxLen = 3.5; 
         if (dist > maxLen) {
             const dir = new THREE.Vector3().subVectors(targetTipPos, tongueRootPos).normalize();
             targetTipPos.copy(tongueRootPos).add(dir.multiplyScalar(maxLen));
@@ -432,7 +429,6 @@ function animate() {
         tongueTipVelocity.set(0, 0, 0);
 
     } else {
-        // アイドル/アニメーション
         let targetLen = 0.15; 
         if (tongueAnimState === 0 && Math.random() < 0.005 && !isSpinning && !isHoldingBg) {
             tongueAnimState = 1; 
@@ -450,14 +446,12 @@ function animate() {
 
         targetTipPos.copy(tongueRootPos).add(restDir.multiplyScalar(targetLen));
 
-        // バネ物理
         const force = new THREE.Vector3().subVectors(targetTipPos, tongueTipPos).multiplyScalar(0.15);
         tongueTipVelocity.add(force);
         tongueTipVelocity.multiplyScalar(0.75); 
         tongueTipPos.add(tongueTipVelocity);
     }
 
-    // ベロのメッシュ適用
     tongue.position.copy(tongueRootPos);
     tongue.lookAt(tongueTipPos);
 
@@ -467,20 +461,8 @@ function animate() {
     tongue.scale.set(thinning, 0.4 * thinning, scaleZ);
 
 
-    // --- 4. 回転と視線 ---
-    if (isSpinning) {
-        sealGroup.rotation.y += spinVelocity;
-        spinVelocity *= CONFIG.interaction.friction;
-        if (Math.abs(spinVelocity) < 0.005) {
-            isSpinning = false;
-            spinVelocity = 0;
-        }
-    } else if (!isDraggingFace && !isDraggingTongue) {
-        sealGroup.rotation.y += (0 - sealGroup.rotation.y) * 0.05;
-    }
-
-    // 視線
-    const isFastSpinning = Math.abs(spinVelocity) > 0.3;
+    // --- 5. 視線制御 ---
+    const isFastSpinning = spinVelocity.length() > 0.15;
     if (isFastSpinning) {
         pupils.left.position.set(0.3, Math.sin(time * 20) * 0.2, 0.65);
         pupils.right.position.set(-0.3, -Math.sin(time * 20) * 0.2, 0.65);
@@ -524,8 +506,7 @@ function onPointerDown(event) {
         dragPoint.copy(hitFace.point);
     } else {
         isHoldingBg = true;
-        spinVelocity = 0;
-        isSpinning = false;
+        spinVelocity.set(0, 0, 0);
     }
 }
 
@@ -553,37 +534,39 @@ function onPointerMove(event) {
 function onPointerUp(event) {
     if (isDraggingTongue) {
         // ベロの反動計算
-        // 現在のベロの根元(Root)は animate() で計算されているが
-        // ここでは tongue.position が最新の根元位置を保持している
-        
-        // 根元から先端(ドラッグ位置)へのベクトル
-        // ローカル空間での簡易計算
         const dx = tongueTipPos.x - tongue.position.x;
+        const dy = tongueTipPos.y - tongue.position.y;
         
-        // 横方向へある程度引っ張っていたら回転させる
-        if (Math.abs(dx) > 0.3) {
-            // 反動なので、引っ張った方向と逆回転（またはスナップバックの勢い）
-            // 右(+x)に引っ張って離すと、ベロは左に戻る力が発生 -> 左向きの力
-            // 左向きの力が顔の前方にかかると、上から見て反時計回り(positive Y rotation)？
-            // 物理的な厳密さより「気持ちよさ」重視で、逆方向へ回転させる
-            // dxがプラス（右）なら、spinVelocityをマイナス（右回転）させると
-            // 引っ張った手を離した瞬間に「ブルンッ」と戻るような動きになる
+        const pullLen = Math.sqrt(dx*dx + dy*dy);
+        
+        if (pullLen > 0.3) {
+            // 右に引っ張る(dx>0) -> 左に戻る勢い -> 左に回る(-Y軸回転)
+            // 上に引っ張る(dy>0) -> 下に戻る勢い -> 下に回る(+X軸回転)
             
-            spinVelocity = -dx * CONFIG.interaction.recoilFactor;
-            isSpinning = true;
+            // 係数を1.5程度に弱めました(CONFIG)
+            const axisX = dy * CONFIG.interaction.recoilFactor * 0.1; 
+            const axisY = -dx * CONFIG.interaction.recoilFactor * 0.1;
+            
+            spinVelocity.x += axisX;
+            spinVelocity.y += axisY;
+        }
+    }
+
+    if (isHoldingBg) {
+        // 背景スワイプ
+        const speed = dragVelocity.length();
+        if (speed > CONFIG.interaction.spinThreshold) {
+            const axisX = dragVelocity.y * 0.01;
+            const axisY = dragVelocity.x * 0.01;
+            
+            spinVelocity.x += axisX;
+            spinVelocity.y += axisY;
         }
     }
 
     isDraggingFace = false;
     isDraggingTongue = false;
-
-    if (isHoldingBg) {
-        isHoldingBg = false;
-        if (Math.abs(dragVelocity.x) > CONFIG.interaction.spinThreshold) {
-            isSpinning = true;
-            spinVelocity = Math.max(Math.min(dragVelocity.x * 0.01, 0.5), -0.5);
-        }
-    }
+    isHoldingBg = false;
 }
 
 function updateMouse(event) {
@@ -597,7 +580,6 @@ function onWindowResize() {
     renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
-// 実行
 init();
 
 </script>
