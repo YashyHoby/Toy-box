@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>8bit Object Camera</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #202020;
+            touch-action: manipulation;
+            font-family: 'Courier New', Courier, monospace; /* レトロ感のあるフォント */
+        }
+        #camera-view {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            z-index: 1;
+            /* 少し粗い画質にするフィルタ（オプション） */
+            image-rendering: pixelated; 
+        }
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+            image-rendering: pixelated;
+        }
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 3;
+            pointer-events: none;
+        }
+        .start-btn {
+            pointer-events: auto;
+            image-rendering: pixelated;
+        }
+        .pixel-border {
+            box-shadow: 
+                -4px 0 0 0 black,
+                4px 0 0 0 black,
+                0 -4px 0 0 black,
+                0 4px 0 0 black;
+        }
+    </style>
+</head>
+<body>
+
+    <video id="webcam" class="hidden" playsinline muted></video>
+    <canvas id="camera-view"></canvas>
+    <canvas id="overlay"></canvas>
+    
+    <div id="ui-layer" class="flex flex-col items-center justify-center bg-black/90 transition-opacity duration-500">
+        <div id="loading-msg" class="text-green-400 text-2xl mb-8 font-bold animate-pulse">
+            LOADING...
+        </div>
+        
+        <button id="start-btn" class="start-btn bg-red-600 hover:bg-red-500 text-white text-xl font-bold py-4 px-8 border-4 border-white pixel-border active:scale-95 transition-transform">
+            PRESS START
+        </button>
+        
+        <p class="text-white mt-8 text-sm px-4 text-center hidden leading-loose" id="instruction">
+            [ MISSION ]<br>
+            FIND OBJECTS & TAP TARGET<br>
+            SCORE: <span id="score-display">00000</span>
+        </p>
+    </div>
+
+    <script>
+        // --- 50種類の定義 (8bit風カテゴリ分け) ---
+        // カテゴリに対応する8bit SEタイプ:
+        // jump, coin, explosion, powerup, laser, damage, select, noise
+        const OBJECT_DB = {
+            'person':        { label: 'PLAYER',   color: '#FF0000', type: 'jump' },
+            'bicycle':       { label: 'BIKE',     color: '#00FF00', type: 'noise' },
+            'car':           { label: 'CAR',      color: '#00FF00', type: 'noise' },
+            'motorcycle':    { label: 'MOTO',     color: '#00FF00', type: 'noise' },
+            'airplane':      { label: 'JET',      color: '#00FF00', type: 'laser' },
+            'bus':           { label: 'BUS',      color: '#00FF00', type: 'noise' },
+            'train':         { label: 'TRAIN',    color: '#00FF00', type: 'noise' },
+            'truck':         { label: 'TRUCK',    color: '#00FF00', type: 'noise' },
+            'boat':          { label: 'BOAT',     color: '#00FF00', type: 'noise' },
+            'traffic light': { label: 'SIGNAL',   color: '#FFFF00', type: 'select' },
+            'fire hydrant':  { label: 'HYDRANT',  color: '#FF00FF', type: 'damage' },
+            'stop sign':     { label: 'STOP',     color: '#FF0000', type: 'damage' },
+            'bird':          { label: 'BIRD',     color: '#FF00FF', type: 'powerup' },
+            'cat':           { label: 'CAT',      color: '#FF00FF', type: 'powerup' },
+            'dog':           { label: 'DOG',      color: '#FF00FF', type: 'powerup' },
+            'horse':         { label: 'HORSE',    color: '#FF00FF', type: 'powerup' },
+            'sheep':         { label: 'SHEEP',    color: '#FF00FF', type: 'powerup' },
+            'cow':           { label: 'COW',      color: '#FF00FF', type: 'powerup' },
+            'elephant':      { label: 'ELEPHANT', color: '#FF00FF', type: 'explosion' },
+            'bear':          { label: 'BEAR',     color: '#FF00FF', type: 'explosion' },
+            'zebra':         { label: 'ZEBRA',    color: '#FF00FF', type: 'powerup' },
+            'giraffe':       { label: 'GIRAFFE',  color: '#FF00FF', type: 'powerup' },
+            'backpack':      { label: 'ITEM',     color: '#00FFFF', type: 'coin' },
+            'umbrella':      { label: 'ITEM',     color: '#00FFFF', type: 'coin' },
+            'handbag':       { label: 'ITEM',     color: '#00FFFF', type: 'coin' },
+            'tie':           { label: 'ITEM',     color: '#00FFFF', type: 'coin' },
+            'suitcase':      { label: 'ITEM',     color: '#00FFFF', type: 'coin' },
+            'sports ball':   { label: 'BALL',     color: '#FFA500', type: 'jump' },
+            'kite':          { label: 'KITE',     color: '#FFA500', type: 'laser' },
+            'baseball bat':  { label: 'WEAPON',   color: '#FFA500', type: 'damage' },
+            'skateboard':    { label: 'BOARD',    color: '#FFA500', type: 'jump' },
+            'surfboard':     { label: 'BOARD',    color: '#FFA500', type: 'jump' },
+            'tennis racket': { label: 'RACKET',   color: '#FFA500', type: 'damage' },
+            'bottle':        { label: 'POTION',   color: '#00FFFF', type: 'coin' },
+            'wine glass':    { label: 'GLASS',    color: '#00FFFF', type: 'coin' },
+            'cup':           { label: 'CUP',      color: '#00FFFF', type: 'coin' },
+            'fork':          { label: 'FORK',     color: '#CCCCCC', type: 'select' },
+            'knife':         { label: 'KNIFE',    color: '#CCCCCC', type: 'select' },
+            'spoon':         { label: 'SPOON',    color: '#CCCCCC', type: 'select' },
+            'bowl':          { label: 'BOWL',     color: '#00FFFF', type: 'coin' },
+            'banana':        { label: 'FOOD',     color: '#FFFF00', type: 'powerup' },
+            'apple':         { label: 'FOOD',     color: '#FF0000', type: 'powerup' },
+            'sandwich':      { label: 'FOOD',     color: '#FFA500', type: 'powerup' },
+            'orange':        { label: 'FOOD',     color: '#FFA500', type: 'powerup' },
+            'broccoli':      { label: 'FOOD',     color: '#00FF00', type: 'powerup' },
+            'carrot':        { label: 'FOOD',     color: '#FFA500', type: 'powerup' },
+            'pizza':         { label: 'FOOD',     color: '#FFA500', type: 'powerup' },
+            'donut':         { label: 'FOOD',     color: '#FF69B4', type: 'powerup' },
+            'cake':          { label: 'FOOD',     color: '#FF69B4', type: 'powerup' },
+            'chair':         { label: 'BLOCK',    color: '#0000FF', type: 'damage' },
+            'couch':         { label: 'BLOCK',    color: '#0000FF', type: 'damage' },
+            'potted plant':  { label: 'PLANT',    color: '#00FF00', type: 'select' },
+            'bed':           { label: 'BED',      color: '#0000FF', type: 'damage' },
+            'dining table':  { label: 'TABLE',    color: '#0000FF', type: 'damage' },
+            'toilet':        { label: 'TOILET',   color: '#FFFFFF', type: 'explosion' },
+            'tv':            { label: 'SCREEN',   color: '#C0C0C0', type: 'laser' },
+            'laptop':        { label: 'PC',       color: '#C0C0C0', type: 'laser' },
+            'mouse':         { label: 'MOUSE',    color: '#C0C0C0', type: 'select' },
+            'remote':        { label: 'REMOTE',   color: '#C0C0C0', type: 'select' },
+            'keyboard':      { label: 'KEYBOARD', color: '#C0C0C0', type: 'laser' },
+            'cell phone':    { label: 'PHONE',    color: '#FF00FF', type: 'laser' },
+            'microwave':     { label: 'OVEN',     color: '#C0C0C0', type: 'explosion' },
+            'oven':          { label: 'OVEN',     color: '#C0C0C0', type: 'explosion' },
+            'toaster':       { label: 'TOASTER',  color: '#C0C0C0', type: 'damage' },
+            'sink':          { label: 'SINK',     color: '#FFFFFF', type: 'noise' },
+            'refrigerator':  { label: 'FRIDGE',   color: '#FFFFFF', type: 'explosion' },
+            'book':          { label: 'BOOK',     color: '#FFFFFF', type: 'select' },
+            'clock':         { label: 'CLOCK',    color: '#FFFFFF', type: 'select' },
+            'vase':          { label: 'VASE',     color: '#00FFFF', type: 'coin' },
+            'scissors':      { label: 'SCISSORS', color: '#CCCCCC', type: 'damage' },
+            'teddy bear':    { label: 'DOLL',     color: '#FF69B4', type: 'powerup' },
+            'hair drier':    { label: 'DRYER',    color: '#C0C0C0', type: 'noise' },
+            'toothbrush':    { label: 'BRUSH',    color: '#FFFFFF', type: 'select' }
+        };
+
+        const MAX_DETECTIONS = 3;
+        let model = undefined;
+        let isDetecting = false;
+        let detections = [];
+        let score = 0;
+
+        const video = document.getElementById('webcam');
+        const canvasView = document.getElementById('camera-view');
+        const canvasOverlay = document.getElementById('overlay');
+        const ctxView = canvasView.getContext('2d');
+        const ctxOverlay = canvasOverlay.getContext('2d');
+        const startBtn = document.getElementById('start-btn');
+        const uiLayer = document.getElementById('ui-layer');
+        const loadingMsg = document.getElementById('loading-msg');
+        const instruction = document.getElementById('instruction');
+        const scoreDisplay = document.getElementById('score-display');
+
+        // --- 8bit Sound Engine ---
+        class EightBitEngine {
+            constructor() {
+                this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+                this.masterGain = this.ctx.createGain();
+                this.masterGain.gain.value = 0.3; // 音量控えめ
+                this.masterGain.connect(this.ctx.destination);
+            }
+
+            resume() {
+                if (this.ctx.state === 'suspended') this.ctx.resume();
+            }
+
+            // オシレーター作成ヘルパー
+            createOsc(type, freq, startTime, duration) {
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, startTime);
+                osc.connect(gain);
+                gain.connect(this.masterGain);
+                return { osc, gain };
+            }
+
+            play(type) {
+                this.resume();
+                const t = this.ctx.currentTime;
+
+                switch (type) {
+                    case 'coin': // コイン音: 高い矩形波2連
+                        {
+                            // 1音目: B5
+                            let o1 = this.createOsc('square', 987, t, 0.1);
+                            o1.gain.gain.setValueAtTime(0.5, t);
+                            o1.gain.gain.linearRampToValueAtTime(0, t + 0.08);
+                            o1.osc.start(t);
+                            o1.osc.stop(t + 0.08);
+
+                            // 2音目: E6 (高い音)
+                            let o2 = this.createOsc('square', 1318, t + 0.08, 0.3);
+                            o2.gain.gain.setValueAtTime(0.5, t + 0.08);
+                            o2.gain.gain.linearRampToValueAtTime(0, t + 0.4);
+                            o2.osc.start(t + 0.08);
+                            o2.osc.stop(t + 0.4);
+                        }
+                        break;
+
+                    case 'jump': // ジャンプ音: 矩形波スウィープアップ
+                        {
+                            let o = this.createOsc('square', 150, t, 0.3);
+                            // 周波数を急激に上げる
+                            o.osc.frequency.linearRampToValueAtTime(600, t + 0.2);
+                            o.gain.gain.setValueAtTime(0.5, t);
+                            o.gain.gain.linearRampToValueAtTime(0, t + 0.2);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.2);
+                        }
+                        break;
+
+                    case 'powerup': // パワーアップ: 高速アルペジオ
+                        {
+                            const notes = [523, 659, 783, 1046, 1318]; // C Major
+                            let now = t;
+                            notes.forEach((freq, i) => {
+                                let o = this.createOsc('square', freq, now, 0.1);
+                                o.gain.gain.setValueAtTime(0.3, now);
+                                o.gain.gain.linearRampToValueAtTime(0, now + 0.08);
+                                o.osc.start(now);
+                                o.osc.stop(now + 0.08);
+                                now += 0.06;
+                            });
+                        }
+                        break;
+
+                    case 'laser': // レーザー: ノコギリ波スウィープダウン
+                        {
+                            let o = this.createOsc('sawtooth', 1200, t, 0.3);
+                            o.osc.frequency.exponentialRampToValueAtTime(200, t + 0.2);
+                            o.gain.gain.setValueAtTime(0.3, t);
+                            o.gain.gain.linearRampToValueAtTime(0, t + 0.2);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.2);
+                        }
+                        break;
+
+                    case 'explosion': // 爆発: 低音ノコギリ波 + ランダム (擬似ノイズ)
+                        {
+                            let o = this.createOsc('sawtooth', 100, t, 0.4);
+                            o.osc.frequency.exponentialRampToValueAtTime(10, t + 0.4);
+                            o.gain.gain.setValueAtTime(0.8, t);
+                            o.gain.gain.exponentialRampToValueAtTime(0.01, t + 0.4);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.4);
+                        }
+                        break;
+
+                    case 'damage': // ダメージ: 低音三角波で下がる
+                        {
+                            let o = this.createOsc('triangle', 200, t, 0.2);
+                            o.osc.frequency.linearRampToValueAtTime(50, t + 0.15);
+                            o.gain.gain.setValueAtTime(0.8, t);
+                            o.gain.gain.linearRampToValueAtTime(0, t + 0.15);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.15);
+                        }
+                        break;
+
+                    case 'select': // カーソル移動音: 短い矩形波
+                        {
+                            let o = this.createOsc('square', 880, t, 0.05);
+                            o.gain.gain.setValueAtTime(0.3, t);
+                            o.gain.gain.linearRampToValueAtTime(0, t + 0.05);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.05);
+                        }
+                        break;
+
+                    case 'noise': // エンジン音風: 低周波矩形波の持続
+                        {
+                            let o = this.createOsc('square', 60, t, 0.3);
+                            // 少しピッチを揺らす
+                            o.osc.frequency.setValueAtTime(60, t);
+                            o.osc.frequency.linearRampToValueAtTime(40, t + 0.1);
+                            o.osc.frequency.linearRampToValueAtTime(60, t + 0.2);
+                            o.gain.gain.setValueAtTime(0.4, t);
+                            o.gain.gain.linearRampToValueAtTime(0, t + 0.3);
+                            o.osc.start(t);
+                            o.osc.stop(t + 0.3);
+                        }
+                        break;
+                }
+            }
+        }
+
+        let soundEngine = null;
+
+        startBtn.addEventListener('click', async () => {
+            startBtn.classList.add('hidden');
+            loadingMsg.classList.remove('hidden');
+            
+            soundEngine = new EightBitEngine();
+            soundEngine.resume();
+            
+            // 効果音テスト（Start音）
+            soundEngine.play('powerup');
+
+            if (!model) {
+                try {
+                    model = await cocoSsd.load();
+                } catch (e) {
+                    alert('LOAD ERROR. RELOAD.');
+                    location.reload();
+                    return;
+                }
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 640 }, // 解像度を落として処理軽く＆レトロ感
+                        height: { ideal: 480 }
+                    }
+                });
+                video.srcObject = stream;
+                
+                video.onloadedmetadata = () => {
+                    video.play();
+                    resizeCanvas();
+                    isDetecting = true;
+                    detectFrame();
+                    
+                    uiLayer.style.background = 'transparent';
+                    uiLayer.style.pointerEvents = 'none';
+                    loadingMsg.classList.add('hidden');
+                    instruction.classList.remove('hidden');
+                    
+                    canvasOverlay.style.pointerEvents = 'auto';
+                    canvasOverlay.addEventListener('mousedown', handleInteraction);
+                    canvasOverlay.addEventListener('touchstart', handleInteraction, {passive: false});
+                };
+            } catch (err) {
+                console.error(err);
+                loadingMsg.innerText = "CAMERA ERROR";
+            }
+        });
+
+        function resizeCanvas() {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+            canvasView.width = w;
+            canvasView.height = h;
+            canvasOverlay.width = w;
+            canvasOverlay.height = h;
+        }
+        window.addEventListener('resize', resizeCanvas);
+
+        async function detectFrame() {
+            if (!isDetecting) return;
+
+            const vidW = video.videoWidth;
+            const vidH = video.videoHeight;
+            const screenW = canvasView.width;
+            const screenH = canvasView.height;
+            const scale = Math.max(screenW / vidW, screenH / vidH);
+            const xOffset = (screenW - (vidW * scale)) / 2;
+            const yOffset = (screenH - (vidH * scale)) / 2;
+
+            ctxView.drawImage(video, xOffset, yOffset, vidW * scale, vidH * scale);
+
+            const predictions = await model.detect(video);
+            
+            detections = predictions
+                .filter(p => OBJECT_DB[p.class] && p.score > 0.4)
+                .sort((a, b) => b.score - a.score)
+                .slice(0, MAX_DETECTIONS)
+                .map(p => {
+                    return {
+                        ...p,
+                        x: xOffset + (p.bbox[0] * scale),
+                        y: yOffset + (p.bbox[1] * scale),
+                        w: p.bbox[2] * scale,
+                        h: p.bbox[3] * scale
+                    };
+                });
+
+            drawOverlay();
+            requestAnimationFrame(detectFrame);
+        }
+
+        function drawOverlay() {
+            ctxOverlay.clearRect(0, 0, canvasOverlay.width, canvasOverlay.height);
+
+            detections.forEach(det => {
+                const conf = OBJECT_DB[det.class];
+                
+                // ドット絵風の枠線（点線ではなく、太い実線で角ばらせる）
+                ctxOverlay.strokeStyle = conf.color;
+                ctxOverlay.lineWidth = 4;
+                
+                ctxOverlay.strokeRect(
+                    Math.floor(det.x), 
+                    Math.floor(det.y), 
+                    Math.floor(det.w), 
+                    Math.floor(det.h)
+                );
+
+                // ラベル背景（黒背景に色文字）
+                ctxOverlay.fillStyle = '#000000';
+                ctxOverlay.fillRect(det.x, det.y - 25, (conf.label.length * 12) + 60, 25);
+                
+                // テキスト
+                ctxOverlay.fillStyle = conf.color;
+                ctxOverlay.font = '20px "Courier New", monospace';
+                ctxOverlay.fillText(`${conf.label} ${Math.floor(det.score * 99)}`, det.x + 5, det.y - 5);
+            });
+        }
+
+        function handleInteraction(e) {
+            e.preventDefault();
+            let clientX, clientY;
+            if (e.type === 'touchstart') {
+                clientX = e.touches[0].clientX;
+                clientY = e.touches[0].clientY;
+            } else {
+                clientX = e.clientX;
+                clientY = e.clientY;
+            }
+
+            let hit = false;
+            for (const det of detections) {
+                if (clientX >= det.x && clientX <= det.x + det.w &&
+                    clientY >= det.y && clientY <= det.y + det.h) {
+                    
+                    const conf = OBJECT_DB[det.class];
+                    if(soundEngine) soundEngine.play(conf.type);
+                    
+                    // スコア加算
+                    score += 100;
+                    scoreDisplay.innerText = score.toString().padStart(5, '0');
+
+                    // ヒットエフェクト（反転）
+                    ctxOverlay.fillStyle = conf.color;
+                    ctxOverlay.globalCompositeOperation = 'difference';
+                    ctxOverlay.fillRect(det.x, det.y, det.w, det.h);
+                    ctxOverlay.globalCompositeOperation = 'source-over';
+                    
+                    hit = true;
+                    break;
+                }
+            }
+        }
+    </script>
+</body>
+</html>
