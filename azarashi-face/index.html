@@ -42,8 +42,8 @@
 
 <div id="canvas-container"></div>
 <div id="ui-layer">
-    <div class="instruction">顔・鼻・ベロをドラッグ: もちもち伸びる</div>
-    <div class="instruction">ベロ/背景: 引っ張って離すと360度回転</div>
+    <div class="instruction">顔・鼻・ベロ: ドラッグでもちもち</div>
+    <div class="instruction">目: クリック/タッチで閉じる（ドラッグ不可）</div>
 </div>
 
 <!-- Three.js Library -->
@@ -55,8 +55,7 @@
  */
 const CONFIG = {
     color: {
-        body: 0x8FA4B5,      // アザラシのグレーブルー
-        belly: 0xE0E8F0,     // お腹の白っぽい色
+        body: new THREE.Color(0x8FA4B5),     // アザラシのグレーブルー
         eyeWhite: 0xFFFFFF,
         pupil: 0x111111,
         nose: 0x222222,
@@ -69,23 +68,29 @@ const CONFIG = {
         maxDeformation: 3.0   
     },
     interaction: {
-        spinThreshold: 5.0,   // 回転判定の閾値
-        friction: 0.97,       // 回転の摩擦
-        recoilFactor: 1.5,    // ベロ反動の強さ (4.0 -> 1.5 に弱めました)
-        recoverySpeed: 0.05   // 正面に戻る速さ
+        spinThreshold: 5.0,   
+        friction: 0.97,       
+        recoilFactor: 1.5,    
+        recoverySpeed: 0.05,
+        blinkSpeed: 0.3       // まばたきの速さ
     }
 };
 
 // グローバル変数
 let scene, camera, renderer;
 let sealGroup, bodyMesh, snoutGroup;
-let eyes = { left: null, right: null };
-let pupils = { left: null, right: null };
+
+// 目の管理用オブジェクト
+let eyes = { 
+    left: { group: null, eyelid: null, pupil: null }, 
+    right: { group: null, eyelid: null, pupil: null } 
+};
+
 let tongue;
 let originalPositions = [];
 let velocities = [];
 
-// パーツ追従用の変数
+// パーツ追従用
 let faceCenterIndices = []; 
 let partsInitialPos = {
     eyesLeft: new THREE.Vector3(),
@@ -98,6 +103,8 @@ let partsInitialPos = {
 let isDraggingFace = false;
 let isDraggingTongue = false; 
 let isHoldingBg = false;
+let isTouchingEye = false; 
+
 let dragPoint = new THREE.Vector3(); 
 let raycaster = new THREE.Raycaster();
 let mouse = new THREE.Vector2();
@@ -105,14 +112,19 @@ let mouse = new THREE.Vector2();
 let lastMousePos = new THREE.Vector2();
 let dragVelocity = new THREE.Vector2();
 
-// 回転制御 (Quaternionベース)
+// 回転制御
 let spinVelocity = new THREE.Vector3(0, 0, 0); 
 let isSpinning = false;
 
+// アニメーション状態
 let tongueAnimState = 0; 
 let tongueTipPos = new THREE.Vector3();      
 let tongueTipVelocity = new THREE.Vector3(); 
 const TONGUE_BASE_LEN = 0.44; 
+
+// まばたき制御 (0: 開, 1: 閉)
+let blinkState = { left: 0, right: 0 };
+let targetBlinkState = { left: 0, right: 0 };
 
 /**
  * 初期化処理
@@ -120,7 +132,6 @@ const TONGUE_BASE_LEN = 0.44;
 function init() {
     const container = document.getElementById('canvas-container');
 
-    // シーン設定
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x87CEEB);
     scene.fog = new THREE.Fog(0x87CEEB, 8, 20);
@@ -196,31 +207,96 @@ function createSeal() {
         }
     }
 
-    // 2. 目
-    const eyeGeo = new THREE.SphereGeometry(0.7, 32, 32);
-    eyeGeo.scale(1, 1, 0.6); 
-    const eyeMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.eyeWhite });
+    // --- 2. 目 ---
+    function createEyeGroup(x, y, z, side) {
+        const group = new THREE.Group();
+        group.position.set(x, y, z);
+        
+        // 2-1. 白目
+        const eyeRadius = 0.7;
+        const eyeGeo = new THREE.SphereGeometry(eyeRadius, 64, 64);
+        eyeGeo.scale(1, 1, 0.6); 
+        const eyeMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.eyeWhite });
+        const eyeball = new THREE.Mesh(eyeGeo, eyeMat);
+        eyeball.userData = { isEye: true, side: side };
+        group.add(eyeball);
 
-    eyes.left = new THREE.Mesh(eyeGeo, eyeMat);
-    eyes.left.position.set(-0.85, 0.4, 2.05);
-    sealGroup.add(eyes.left);
+        // 2-2. 黒目 (修正: さらに薄く、奥へ)
+        const pupilGeo = new THREE.SphereGeometry(0.20, 32, 32);
+        // 厚みを0.3 -> 0.15 に削減
+        pupilGeo.scale(1, 1, 0.15); 
+        const pupilMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.pupil });
+        const pupil = new THREE.Mesh(pupilGeo, pupilMat);
+        // 位置を0.42 -> 0.405 (白目表面ギリギリ)へ後退
+        pupil.position.z = 0.405; 
+        pupil.userData = { isEye: true, side: side }; 
+        group.add(pupil);
 
-    eyes.right = new THREE.Mesh(eyeGeo, eyeMat);
-    eyes.right.position.set(0.85, 0.4, 2.05);
-    sealGroup.add(eyes.right);
+        // 2-3. まぶた (修正: わずかに厚みを戻して黒目をカバー)
+        const eyelidRadius = 0.701; 
+        const eyelidGeo = new THREE.SphereGeometry(eyelidRadius, 64, 64);
+        // 厚み: 0.68 -> 0.7 (黒目先端より確実に前に来るように)
+        eyelidGeo.scale(1, 1, 0.7);
 
-    // 3. 瞳孔
-    const pupilGeo = new THREE.SphereGeometry(0.19, 16, 16);
-    pupilGeo.scale(1, 1, 0.3);
-    const pupilMat = new THREE.MeshBasicMaterial({ color: CONFIG.color.pupil });
+        const eyelidMat = new THREE.MeshStandardMaterial({
+            color: CONFIG.color.body,
+            roughness: 0.7,
+            metalness: 0.1,
+            transparent: false,
+            side: THREE.FrontSide
+        });
 
-    pupils.left = new THREE.Mesh(pupilGeo, pupilMat);
-    pupils.left.position.set(0, 0, 0.65);
-    eyes.left.add(pupils.left);
+        eyelidMat.onBeforeCompile = (shader) => {
+            shader.uniforms.uBlink = { value: 0.0 };
+            eyelidMat.userData.shader = shader;
 
-    pupils.right = new THREE.Mesh(pupilGeo, pupilMat);
-    pupils.right.position.set(0, 0, 0.65);
-    eyes.right.add(pupils.right);
+            shader.vertexShader = `
+                varying vec3 vLocalPosition;
+                ${shader.vertexShader}
+            `.replace(
+                '#include <begin_vertex>',
+                `
+                #include <begin_vertex>
+                vLocalPosition = position;
+                `
+            );
+
+            shader.fragmentShader = `
+                uniform float uBlink;
+                varying vec3 vLocalPosition;
+                ${shader.fragmentShader}
+            `.replace(
+                '#include <dithering_fragment>',
+                `
+                #include <dithering_fragment>
+                
+                // まばたきロジック
+                float limit = 0.705;
+                float threshold = limit - (uBlink * limit * 2.0);
+
+                if (vLocalPosition.y < threshold && vLocalPosition.y > -threshold) {
+                    discard;
+                }
+                `
+            );
+        };
+
+        const eyelid = new THREE.Mesh(eyelidGeo, eyelidMat);
+        eyelid.userData = { isEye: true, side: side }; 
+        eyelid.renderOrder = 2; // 最前面
+
+        group.add(eyelid);
+
+        return { group, pupil, eyelid };
+    }
+
+    eyes.left = createEyeGroup(-0.85, 0.4, 2.05, 'left');
+    sealGroup.add(eyes.left.group);
+
+    eyes.right = createEyeGroup(0.85, 0.4, 2.05, 'right');
+    sealGroup.add(eyes.right.group);
+    
+    // -----------------------
 
     // 4. マズルと鼻
     snoutGroup = new THREE.Group();
@@ -293,10 +369,9 @@ function createSeal() {
     tongue.visible = true; 
     sealGroup.add(tongue);
 
-    // 斑点生成コードを削除しました
 
-    partsInitialPos.eyesLeft.copy(eyes.left.position);
-    partsInitialPos.eyesRight.copy(eyes.right.position);
+    partsInitialPos.eyesLeft.copy(eyes.left.group.position);
+    partsInitialPos.eyesRight.copy(eyes.right.group.position);
     partsInitialPos.snout.copy(snoutGroup.position);
     partsInitialPos.tongue.copy(tongue.position);
     
@@ -380,35 +455,27 @@ function animate() {
     }
     if (deformationCount > 0) faceDeformation.divideScalar(deformationCount);
 
-    eyes.left.position.copy(partsInitialPos.eyesLeft).add(faceDeformation);
-    eyes.right.position.copy(partsInitialPos.eyesRight).add(faceDeformation);
+    eyes.left.group.position.copy(partsInitialPos.eyesLeft).add(faceDeformation);
+    eyes.right.group.position.copy(partsInitialPos.eyesRight).add(faceDeformation);
     snoutGroup.position.copy(partsInitialPos.snout).add(faceDeformation);
-
-
+    
     // --- 3. 360度回転処理 ---
     const speed = spinVelocity.length();
-    
     if (speed > 0.001) {
         isSpinning = true;
-        
         const axis = spinVelocity.clone().normalize();
         const angle = speed;
-        
         const deltaQ = new THREE.Quaternion();
         deltaQ.setFromAxisAngle(axis, angle);
-        
         sealGroup.quaternion.premultiply(deltaQ);
         spinVelocity.multiplyScalar(CONFIG.interaction.friction);
-        
     } else {
         isSpinning = false;
-        
         if (!isDraggingFace && !isDraggingTongue && !isHoldingBg) {
             const targetQ = new THREE.Quaternion(); 
             sealGroup.quaternion.slerp(targetQ, CONFIG.interaction.recoverySpeed);
         }
     }
-
 
     // --- 4. ベロの物理演算 ---
     const tongueRootPos = partsInitialPos.tongue.clone().add(faceDeformation);
@@ -461,22 +528,39 @@ function animate() {
     tongue.scale.set(thinning, 0.4 * thinning, scaleZ);
 
 
-    // --- 5. 視線制御 ---
+    // --- 5. 視線とまばたきの制御 ---
     const isFastSpinning = spinVelocity.length() > 0.15;
+    
+    // まばたきアニメーション (Shader Uniform更新)
+    ['left', 'right'].forEach(side => {
+        const diff = targetBlinkState[side] - blinkState[side];
+        blinkState[side] += diff * CONFIG.interaction.blinkSpeed;
+        
+        if (eyes[side].eyelid && eyes[side].eyelid.material.userData.shader) {
+            eyes[side].eyelid.material.userData.shader.uniforms.uBlink.value = blinkState[side];
+        }
+    });
+
+
+    // 視線（黒目）の移動
     if (isFastSpinning) {
-        pupils.left.position.set(0.3, Math.sin(time * 20) * 0.2, 0.65);
-        pupils.right.position.set(-0.3, -Math.sin(time * 20) * 0.2, 0.65);
+        eyes.left.pupil.position.set(0.2, Math.sin(time * 20) * 0.1, 0.405);
+        eyes.right.pupil.position.set(-0.2, -Math.sin(time * 20) * 0.1, 0.405);
     } else {
         let targetX = 0;
         let targetY = 0;
-        if (isDraggingFace || isDraggingTongue || isHoldingBg) {
-            targetX = mouse.x * 0.4;
-            targetY = mouse.y * 0.4;
+        if ((isDraggingFace || isDraggingTongue || isHoldingBg) && !isTouchingEye) {
+            targetX = mouse.x * 0.3;
+            targetY = mouse.y * 0.3;
         }
-        pupils.left.position.x += (targetX - pupils.left.position.x) * 0.2;
-        pupils.left.position.y += (targetY - pupils.left.position.y) * 0.2;
-        pupils.right.position.x += (targetX - pupils.right.position.x) * 0.2;
-        pupils.right.position.y += (targetY - pupils.right.position.y) * 0.2;
+        
+        const pLeft = eyes.left.pupil.position;
+        const pRight = eyes.right.pupil.position;
+        
+        pLeft.x += (targetX - pLeft.x) * 0.2;
+        pLeft.y += (targetY - pLeft.y) * 0.2;
+        pRight.x += (targetX - pRight.x) * 0.2;
+        pRight.y += (targetY - pRight.y) * 0.2;
     }
 
     renderer.render(scene, camera);
@@ -494,19 +578,35 @@ function onPointerDown(event) {
     const intersects = raycaster.intersectObjects(scene.children, true);
     
     const hitTongue = intersects.find(hit => hit.object.userData.isTongue);
+    const hitEye = intersects.find(hit => hit.object.userData.isEye); 
     const hitFace = intersects.find(hit => hit.object.userData.isFace);
 
     if (hitTongue) {
         isDraggingTongue = true;
         isDraggingFace = false;
+        isTouchingEye = false;
         dragPoint.copy(hitTongue.point);
+    } else if (hitEye) {
+        isDraggingTongue = false;
+        isDraggingFace = false;
+        isTouchingEye = true;
+        
+        if (hitEye.object.userData.side === 'left') targetBlinkState.left = 1;
+        if (hitEye.object.userData.side === 'right') targetBlinkState.right = 1;
+
     } else if (hitFace) {
         isDraggingFace = true;
         isDraggingTongue = false;
+        isTouchingEye = false;
         dragPoint.copy(hitFace.point);
+        targetBlinkState.left = 0;
+        targetBlinkState.right = 0;
+
     } else {
         isHoldingBg = true;
         spinVelocity.set(0, 0, 0);
+        targetBlinkState.left = 0;
+        targetBlinkState.right = 0;
     }
 }
 
@@ -516,9 +616,9 @@ function onPointerMove(event) {
     dragVelocity.subVectors(currentPos, lastMousePos);
     lastMousePos.copy(currentPos);
 
+    raycaster.setFromCamera(mouse, camera);
+
     if (isDraggingFace || isDraggingTongue) {
-        raycaster.setFromCamera(mouse, camera);
-        
         const targetZ = 2.5; 
         const vec = new THREE.Vector3();
         vec.set(mouse.x, mouse.y, 0.5);
@@ -526,39 +626,29 @@ function onPointerMove(event) {
         vec.sub(camera.position).normalize();
         const distance = (targetZ - camera.position.z) / vec.z;
         const pos = new THREE.Vector3().copy(camera.position).add(vec.multiplyScalar(distance));
-        
         dragPoint.copy(pos);
     }
 }
 
 function onPointerUp(event) {
     if (isDraggingTongue) {
-        // ベロの反動計算
         const dx = tongueTipPos.x - tongue.position.x;
         const dy = tongueTipPos.y - tongue.position.y;
-        
         const pullLen = Math.sqrt(dx*dx + dy*dy);
         
         if (pullLen > 0.3) {
-            // 右に引っ張る(dx>0) -> 左に戻る勢い -> 左に回る(-Y軸回転)
-            // 上に引っ張る(dy>0) -> 下に戻る勢い -> 下に回る(+X軸回転)
-            
-            // 係数を1.5程度に弱めました(CONFIG)
             const axisX = dy * CONFIG.interaction.recoilFactor * 0.1; 
             const axisY = -dx * CONFIG.interaction.recoilFactor * 0.1;
-            
             spinVelocity.x += axisX;
             spinVelocity.y += axisY;
         }
     }
 
     if (isHoldingBg) {
-        // 背景スワイプ
         const speed = dragVelocity.length();
         if (speed > CONFIG.interaction.spinThreshold) {
             const axisX = dragVelocity.y * 0.01;
             const axisY = dragVelocity.x * 0.01;
-            
             spinVelocity.x += axisX;
             spinVelocity.y += axisY;
         }
@@ -567,6 +657,10 @@ function onPointerUp(event) {
     isDraggingFace = false;
     isDraggingTongue = false;
     isHoldingBg = false;
+    isTouchingEye = false;
+
+    targetBlinkState.left = 0;
+    targetBlinkState.right = 0;
 }
 
 function updateMouse(event) {
