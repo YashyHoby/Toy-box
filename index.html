@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Little People AR (Interactive)</title>
+    <title>Little People AR (Animated & Touch)</title>
     <style>
         body {
             margin: 0;
@@ -14,6 +14,7 @@
             color: white;
             user-select: none;
             -webkit-user-select: none;
+            touch-action: none; /* Prevent default touch actions */
         }
         #info {
             position: absolute;
@@ -71,9 +72,6 @@
             cursor: pointer;
             display: none;
         }
-        #ar-button:hover {
-            opacity: 1;
-        }
         #reset-button {
             position: absolute;
             top: 20px;
@@ -92,10 +90,10 @@
 <body>
     <div id="info">
         WebXR AR体験<br>
-        床を認識すると自動で小人(極小)が出現します<br>
-        タップ：衝撃 / 長押し：集合
+        画面の好きな場所をタップしてインタラクション<br>
+        長押し：集合
     </div>
-    <div id="overlay">グリッドが表示されれば認識OK</div>
+    <div id="overlay">床を認識すると出現します</div>
     <div id="debug-console"></div>
     
     <button id="reset-button">RESET</button>
@@ -117,7 +115,6 @@
 
         let container;
         let camera, scene, renderer;
-        let controller;
         let reticle;
         let hitTestSource = null;
         let hitTestSourceRequested = false;
@@ -125,7 +122,7 @@
         // PC Debugging Tools
         let controls;
         let debugGrid;
-        let debugPlane;
+        let floorPlane; // Invisible plane for raycasting
         let raycaster;
         let mouse;
         let isARActive = false;
@@ -137,6 +134,7 @@
         // Interaction State
         let isPressing = false;
         let pressStartTime = 0;
+        let lastTouchPosition = new THREE.Vector2(); // For raycasting
         const LONG_PRESS_THRESHOLD = 300; // ms
 
         // Effects
@@ -153,7 +151,8 @@
         initARSupport();
 
         // --- UI Events ---
-        resetButton.addEventListener('click', () => {
+        resetButton.addEventListener('click', (e) => {
+            e.stopPropagation(); // Prevent game interaction
             // Remove all dwarfs
             dwarfs.forEach(d => scene.remove(d.mesh));
             dwarfs = [];
@@ -162,7 +161,6 @@
             shockwaves.forEach(s => scene.remove(s.mesh));
             shockwaves = [];
 
-            // Reset interaction
             attractionPoint = null;
         });
 
@@ -170,10 +168,9 @@
             console.error(msg);
             debugConsole.style.display = 'block';
             debugConsole.textContent = "Error: " + msg;
-            infoDiv.textContent = "エラーが発生しました (詳細は赤枠内)";
+            infoDiv.textContent = "エラーが発生しました";
         }
 
-        // --- Custom AR Initialization ---
         async function initARSupport() {
             if ('xr' in navigator) {
                 try {
@@ -187,20 +184,17 @@
                         arButton.style.display = 'block';
                         arButton.textContent = 'AR NOT SUPPORTED';
                         arButton.disabled = true;
-                        showError("お使いのデバイス/ブラウザはWebXR ARに対応していません。\n(Chrome on Android推奨)");
                     }
                 } catch (e) {
                     showError("WebXR Check Error: " + e.message);
                 }
             } else {
                 arButton.style.display = 'none';
-                console.log("WebXR not available on this device");
             }
         }
 
         async function onARButtonClick() {
             if (!navigator.xr) return;
-            
             try {
                 const session = await navigator.xr.requestSession('immersive-ar', {
                     requiredFeatures: ['hit-test'],
@@ -215,16 +209,13 @@
                 
                 isARActive = true;
                 arButton.style.display = 'none';
-                resetButton.style.display = 'none'; // Hide reset in AR (or keep if desired, usually overlaid)
-                // Actually keep reset button but style it for AR? Let's keep it visible.
                 resetButton.style.display = 'block'; 
-                
                 debugGrid.visible = false;
                 controls.enabled = false;
-                infoDiv.innerHTML = "床をスキャン中...<br>グリッドが出たら自動で出現します";
+                infoDiv.innerHTML = "床をスキャン中...<br>認識すると自動で出現します";
                 
             } catch (e) {
-                showError("AR起動エラー:\n" + e.message + "\n\n※このプレビュー画面(iframe)ではブロックされることがあります。");
+                showError("AR起動エラー:\n" + e.message);
             }
         }
 
@@ -251,11 +242,11 @@
             camera.position.set(0, 1.6, 2);
 
             // Lighting
-            const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1.2);
             hemisphereLight.position.set(0.5, 1, 0.25);
             scene.add(hemisphereLight);
 
-            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
             directionalLight.position.set(0, 10, 0);
             directionalLight.castShadow = true;
             scene.add(directionalLight);
@@ -274,51 +265,32 @@
             debugGrid = new THREE.GridHelper(10, 20);
             scene.add(debugGrid);
 
+            // Invisible plane for raycasting (Shared by PC and AR)
             const planeGeo = new THREE.PlaneGeometry(100, 100);
-            const planeMat = new THREE.MeshBasicMaterial({ visible: false });
-            debugPlane = new THREE.Mesh(planeGeo, planeMat);
-            debugPlane.rotation.x = -Math.PI / 2;
-            scene.add(debugPlane);
+            const planeMat = new THREE.MeshBasicMaterial({ visible: false, side: THREE.DoubleSide });
+            floorPlane = new THREE.Mesh(planeGeo, planeMat);
+            floorPlane.rotation.x = -Math.PI / 2;
+            scene.add(floorPlane);
 
             raycaster = new THREE.Raycaster();
             mouse = new THREE.Vector2();
 
-            // PC Events
-            window.addEventListener('pointermove', onPointerMove);
-            window.addEventListener('pointerdown', onPointerDown);
-            window.addEventListener('pointerup', onPointerUp);
-
-            // --- AR Controller ---
-            controller = renderer.xr.getController(0);
-            controller.addEventListener('selectstart', onSelectStart);
-            controller.addEventListener('selectend', onSelectEnd);
-            scene.add(controller);
+            // --- Input Events (Touch & Mouse) ---
+            // We use standard DOM events for both PC and AR (via dom-overlay)
+            document.body.addEventListener('pointerdown', onPointerDown);
+            document.body.addEventListener('pointerup', onPointerUp);
+            document.body.addEventListener('pointermove', onPointerMove);
+            // Touch specific for better mobile handling
+            document.body.addEventListener('touchstart', onTouchStart, { passive: false });
+            document.body.addEventListener('touchend', onTouchEnd);
+            document.body.addEventListener('touchmove', onTouchMove, { passive: false });
 
             // --- Reticle (Scanning Grid) ---
-            // Use a larger GridHelper to represent the detected plane mesh
             reticle = new THREE.Group();
-            
-            // Core Ring
-            const ringMesh = new THREE.Mesh(
-                new THREE.RingGeometry(0.1, 0.12, 32).rotateX(-Math.PI / 2),
-                new THREE.MeshBasicMaterial({ color: 0x00ffff })
-            );
-            reticle.add(ringMesh);
-
-            // Large Grid (Visual Feedback for "Plane")
-            const gridHelper = new THREE.GridHelper(2, 10, 0x00ffff, 0x00aaaa);
-            // Make grid slightly transparent
+            const gridHelper = new THREE.GridHelper(1, 10, 0x00ffff, 0x00aaaa);
             gridHelper.material.transparent = true;
             gridHelper.material.opacity = 0.3;
             reticle.add(gridHelper);
-
-            // Pulsing dot center
-            const dot = new THREE.Mesh(
-                new THREE.CircleGeometry(0.02, 16).rotateX(-Math.PI/2),
-                new THREE.MeshBasicMaterial({ color: 0xffffff })
-            );
-            reticle.add(dot);
-            
             reticle.matrixAutoUpdate = false;
             reticle.visible = false;
             scene.add(reticle);
@@ -326,122 +298,128 @@
             window.addEventListener('resize', onWindowResize);
         }
 
-        // --- Interaction Logic ---
+        // --- Interaction Logic (Touch at specific point) ---
 
-        function onPointerMove(event) {
-            if (isARActive) return;
-            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-            
+        function updateRaycasterFromEvent(clientX, clientY) {
+            mouse.x = (clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(clientY / window.innerHeight) * 2 + 1;
             raycaster.setFromCamera(mouse, camera);
-            const intersects = raycaster.intersectObject(debugPlane);
+        }
+
+        function getInteractionPoint() {
+            // Intersect with the floor plane
+            const intersects = raycaster.intersectObject(floorPlane);
             if (intersects.length > 0) {
-                reticle.visible = true;
-                reticle.position.copy(intersects[0].point);
-                reticle.rotation.set(0,0,0);
-                reticle.updateMatrix();
-            } else {
-                reticle.visible = false;
+                return intersects[0].point;
+            }
+            return null;
+        }
+
+        // --- Event Handlers ---
+
+        function onPointerDown(event) { if (event.pointerType === 'mouse') handleStart(event.clientX, event.clientY); }
+        function onPointerUp(event) { if (event.pointerType === 'mouse') handleEnd(); }
+        function onPointerMove(event) { if (event.pointerType === 'mouse') handleMove(event.clientX, event.clientY); }
+
+        function onTouchStart(event) {
+            if (event.touches.length > 0) {
+                // Prevent default scrolling on some devices if needed
+                // event.preventDefault(); 
+                const t = event.touches[0];
+                handleStart(t.clientX, t.clientY);
+            }
+        }
+        function onTouchEnd(event) { handleEnd(); }
+        function onTouchMove(event) {
+            if (event.touches.length > 0) {
+                const t = event.touches[0];
+                handleMove(t.clientX, t.clientY);
             }
         }
 
-        // --- Unified Input Handling (PC & AR) ---
-
-        function onPointerDown() {
-            if (isARActive) return; // Handled by selectstart
-            handlePressStart();
-        }
-
-        function onPointerUp() {
-            if (isARActive) return; // Handled by selectend
-            handlePressEnd();
-        }
-
-        function onSelectStart() {
-            handlePressStart();
-        }
-
-        function onSelectEnd() {
-            handlePressEnd();
-        }
-
-        function handlePressStart() {
+        function handleStart(x, y) {
             isPressing = true;
             pressStartTime = Date.now();
+            updateRaycasterFromEvent(x, y);
         }
 
-        function handlePressEnd() {
-            isPressing = false;
-            const duration = Date.now() - pressStartTime;
-            attractionPoint = null; // Stop gathering
-
-            if (duration < LONG_PRESS_THRESHOLD) {
-                // Short Tap: Trigger Shockwave
-                triggerShockwave();
+        function handleMove(x, y) {
+            if (isPressing) {
+                updateRaycasterFromEvent(x, y);
             }
         }
 
-        function triggerShockwave() {
-            if (!reticle.visible) return;
+        function handleEnd() {
+            if (!isPressing) return;
+            isPressing = false;
+            const duration = Date.now() - pressStartTime;
+            attractionPoint = null;
 
-            // 1. Get position from reticle
-            const center = new THREE.Vector3();
-            center.setFromMatrixPosition(reticle.matrix);
+            if (duration < LONG_PRESS_THRESHOLD) {
+                // Tap Interaction
+                const point = getInteractionPoint();
+                if (point) {
+                    triggerShockwave(point);
+                }
+            }
+        }
 
-            // 2. Visual Effect
+        function triggerShockwave(center) {
             createShockwaveEffect(center);
 
-            // 3. Physics (Jump dwarfs)
-            // Scale adjusted parameters
-            const impactRadius = 0.2; // 20cm radius
+            const impactRadius = 0.3; // 30cm radius
 
             dwarfs.forEach(dwarf => {
                 const dist = dwarf.mesh.position.distanceTo(center);
-                if (dist < impactRadius) { // Radius of impact
-                    // Calculate force direction (away and up)
+                if (dist < impactRadius) {
                     const dir = new THREE.Vector3().subVectors(dwarf.mesh.position, center).normalize();
-                    dir.y = 0.5; // Upward bias
-                    
-                    // Force strength
-                    const force = (impactRadius - dist) * 10; 
-                    
+                    dir.y = 0.8; // More upward
+                    const force = (impactRadius - dist) * 12; 
                     dwarf.applyForce(force);
                 }
             });
         }
 
         function createShockwaveEffect(position) {
-            // Scale adjusted visual effect
-            const geometry = new THREE.RingGeometry(0.01, 0.02, 32).rotateX(-Math.PI/2);
+            const geometry = new THREE.RingGeometry(0.01, 0.05, 32).rotateX(-Math.PI/2);
             const material = new THREE.MeshBasicMaterial({ 
                 color: 0xffffff, 
                 transparent: true, 
-                opacity: 0.8,
+                opacity: 0.9,
                 side: THREE.DoubleSide
             });
             const mesh = new THREE.Mesh(geometry, material);
             mesh.position.copy(position);
-            mesh.position.y += 0.002; // Just above ground
+            mesh.position.y += 0.002;
             
             scene.add(mesh);
             shockwaves.push({ mesh, age: 0 });
         }
 
-        // --- Auto Spawning & Logic ---
+        // --- Game Loop Update ---
         let lastSpawnTime = 0;
 
         function updateGameLogic(time) {
+            // Update Floor Plane position based on AR Reticle
+            // This ensures our raycasts hit the "real" floor height detected by AR
+            if (reticle.visible) {
+                const reticlePos = new THREE.Vector3();
+                reticlePos.setFromMatrixPosition(reticle.matrix);
+                
+                // Smoothly update floor plane height to match reticle
+                // We only update Y to avoid jumping around too much
+                floorPlane.position.y = THREE.MathUtils.lerp(floorPlane.position.y, reticlePos.y, 0.1);
+            }
+
             // 1. Auto Spawn
             if (reticle.visible && dwarfs.length < maxDwarfs) {
-                // Spawn roughly every 0.3 seconds if conditions met
-                if (time - lastSpawnTime > 0.3) {
-                    if (Math.random() < 0.3) { // 30% chance per check
+                if (time - lastSpawnTime > 0.4) {
+                    if (Math.random() < 0.3) {
                         const center = new THREE.Vector3();
                         center.setFromMatrixPosition(reticle.matrix);
                         
-                        // Random offset within the grid
                         const angle = Math.random() * Math.PI * 2;
-                        const dist = Math.random() * 0.5; // Spread 50cm
+                        const dist = Math.random() * 0.4;
                         center.x += Math.cos(angle) * dist;
                         center.z += Math.sin(angle) * dist;
 
@@ -453,60 +431,89 @@
             }
 
             // 2. Attraction Logic (Long Press)
-            if (isPressing && reticle.visible) {
-                const target = new THREE.Vector3();
-                target.setFromMatrixPosition(reticle.matrix);
-                attractionPoint = target;
+            if (isPressing) {
+                const target = getInteractionPoint();
+                if (target) {
+                    attractionPoint = target;
+                }
             }
         }
 
 
-        // --- Dwarf Class ---
+        // --- Dwarf Class (Animated Humanoid) ---
         class Dwarf {
             constructor(position) {
                 this.mesh = new THREE.Group();
                 this.mesh.position.copy(position);
                 
-                // === Scale Down to 1/20 ===
-                // Original: 0.05 (5cm) -> New: 0.0025 (2.5mm)
+                // Scale (Tiny ~2.5mm - 3.5mm)
                 const baseScale = 0.05 / 20; 
                 const scale = baseScale + (Math.random() * baseScale * 0.4); 
                 this.mesh.scale.set(scale, scale, scale);
 
-                // Simple geometry
-                const bodyGeo = new THREE.CapsuleGeometry(1, 1.5, 4, 8);
-                const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
-                this.body = new THREE.Mesh(bodyGeo, bodyMat);
-                this.body.position.y = 0.75;
-                this.mesh.add(this.body);
+                // Material
+                const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.4 });
 
-                const headGeo = new THREE.SphereGeometry(0.7, 16, 16);
-                this.head = new THREE.Mesh(headGeo, bodyMat);
-                this.head.position.y = 1.6;
-                this.mesh.add(this.head);
+                // --- Rigging ---
+                // Body Group (Everything except root position)
+                this.bodyGroup = new THREE.Group();
+                this.mesh.add(this.bodyGroup);
 
-                // Pop animation on spawn
+                // Torso
+                const torsoGeo = new THREE.CapsuleGeometry(0.5, 0.8, 4, 8);
+                this.torso = new THREE.Mesh(torsoGeo, mat);
+                this.torso.position.y = 1.0;
+                this.bodyGroup.add(this.torso);
+
+                // Head
+                const headGeo = new THREE.SphereGeometry(0.5, 12, 12);
+                this.head = new THREE.Mesh(headGeo, mat);
+                this.head.position.y = 1.8;
+                this.bodyGroup.add(this.head);
+
+                // Limbs Helper
+                const limbGeo = new THREE.CapsuleGeometry(0.15, 0.6, 4, 8);
+                
+                // Arms
+                this.armL = new THREE.Mesh(limbGeo, mat);
+                this.armL.position.set(-0.6, 1.3, 0);
+                this.bodyGroup.add(this.armL);
+
+                this.armR = new THREE.Mesh(limbGeo, mat);
+                this.armR.position.set(0.6, 1.3, 0);
+                this.bodyGroup.add(this.armR);
+
+                // Legs
+                this.legL = new THREE.Mesh(limbGeo, mat);
+                this.legL.position.set(-0.3, 0.4, 0);
+                this.bodyGroup.add(this.legL);
+
+                this.legR = new THREE.Mesh(limbGeo, mat);
+                this.legR.position.set(0.3, 0.4, 0);
+                this.bodyGroup.add(this.legR);
+
+                // Animation State
+                this.walkCycle = Math.random() * 10;
+
+                // Pop animation
                 this.mesh.scale.set(0,0,0);
                 this.targetScale = scale;
                 this.spawnAnim = 0;
 
                 scene.add(this.mesh);
 
+                // Logic State
                 this.state = 'IDLE';
                 this.stateTimer = 0;
                 this.destination = null;
-                this.velocity = new THREE.Vector3(); // For physics
+                this.velocity = new THREE.Vector3();
                 this.baseY = position.y; 
-                
-                // === Speed Adjustment ===
-                // 1/10 to keep them visible but fast like ants
                 this.speed = (0.5 + Math.random() * 0.5) / 10; 
                 this.isSleepy = Math.random() > 0.7;
             }
 
             applyForce(force) {
                 this.velocity.y += force;
-                // Add some random horizontal scatter
                 this.velocity.x += (Math.random() - 0.5) * force;
                 this.velocity.z += (Math.random() - 0.5) * force;
                 this.state = 'JUMP';
@@ -515,21 +522,17 @@
             update(delta, time) {
                 this.stateTimer -= delta;
 
-                // Spawn Animation
+                // Spawn Anim
                 if (this.spawnAnim < 1) {
                     this.spawnAnim += delta * 3;
                     const s = Math.min(this.spawnAnim, 1) * this.targetScale;
                     this.mesh.scale.set(s,s,s);
                 }
 
-                // Physics (Gravity/Velocity)
-                this.velocity.y -= 9.8 * delta; // Gravity
-                
-                // Air resistance
+                // Physics
+                this.velocity.y -= 9.8 * delta; 
                 this.velocity.x *= 0.95;
                 this.velocity.z *= 0.95;
-
-                // Apply velocity
                 this.mesh.position.add(this.velocity.clone().multiplyScalar(delta));
 
                 // Ground Collision
@@ -539,16 +542,17 @@
                     
                     if (this.state === 'JUMP') {
                         this.state = 'IDLE';
-                        this.body.scale.set(1.2, 0.8, 1.2); // Landing squash
-                    } else {
-                        this.body.scale.lerp(new THREE.Vector3(1,1,1), delta * 5); // Return to normal
+                        // Reset Pose
+                        this.resetPose();
                     }
                 } else {
-                    this.state = 'JUMP'; // In air
-                    this.body.scale.set(0.9, 1.1, 0.9); // Air stretch
+                    this.state = 'JUMP';
                 }
 
-                if (this.state === 'JUMP') return;
+                if (this.state === 'JUMP') {
+                    this.animateJump();
+                    return;
+                }
 
                 // AI Logic Override
                 if (attractionPoint) {
@@ -559,22 +563,22 @@
 
                 switch (this.state) {
                     case 'IDLE':
+                        this.animateIdle(time);
                         if (this.stateTimer <= 0) {
                             const r = Math.random();
                             if (r < 0.1 && this.isSleepy) this.enterState('SLEEP');
-                            else if (r < 0.4) this.enterState('MOVE');
+                            else if (r < 0.5) this.enterState('MOVE');
                             else {
                                 this.mesh.rotation.y += (Math.random() - 0.5) * 2;
                                 this.stateTimer = 1 + Math.random() * 2;
                             }
                         }
-                        this.wobble(time, 0.5);
                         break;
 
                     case 'MOVE':
                         if (!this.destination) {
                             const angle = Math.random() * Math.PI * 2;
-                            const dist = 0.05 + Math.random() * 0.15; // Move small distances (5cm - 20cm)
+                            const dist = 0.05 + Math.random() * 0.15;
                             this.destination = new THREE.Vector3(
                                 this.mesh.position.x + Math.cos(angle) * dist,
                                 this.baseY,
@@ -593,19 +597,19 @@
                         if (attractionPoint) {
                             let target = attractionPoint.clone();
                             if (this.mesh.position.distanceTo(target) < 0.05) {
-                                this.wobble(time, 5); 
+                                // Close enough
                             }
-                            this.moveTo(target, delta, this.speed * 2.0); // Gather speed
+                            this.moveTo(target, delta, this.speed * 2.5);
                         }
                         break;
 
                     case 'SLEEP':
-                        this.mesh.rotation.x = THREE.MathUtils.lerp(this.mesh.rotation.x, -Math.PI / 2, delta * 2);
-                        this.mesh.position.y = this.baseY - 0.02 * this.mesh.scale.x;
+                        this.bodyGroup.rotation.x = THREE.MathUtils.lerp(this.bodyGroup.rotation.x, -Math.PI / 2, delta * 2);
+                        this.bodyGroup.position.y = -0.3; // Sink a bit
                         if (this.stateTimer <= 0) {
-                            this.mesh.rotation.x = 0;
+                            this.bodyGroup.rotation.x = 0;
+                            this.bodyGroup.position.y = 0;
                             this.enterState('IDLE');
-                            // Small wake up jump
                             this.velocity.y = 0.1; 
                         }
                         break;
@@ -617,7 +621,6 @@
                 if (newState === 'SLEEP') this.stateTimer = 5 + Math.random() * 10;
                 else if (newState === 'MOVE') this.stateTimer = 5;
                 else this.stateTimer = 2;
-                if (newState !== 'SLEEP') this.mesh.rotation.x = 0;
             }
 
             moveTo(target, delta, speed) {
@@ -625,13 +628,38 @@
                 this.mesh.lookAt(lookTarget);
                 const dir = new THREE.Vector3().subVectors(target, this.mesh.position).normalize();
                 this.mesh.position.add(dir.multiplyScalar(speed * delta * 0.2));
-                this.wobble(Date.now() / 1000, 15 * speed);
+                
+                // Walking Animation
+                this.walkCycle += delta * speed * 200; // Speed up anim
+                const swing = Math.sin(this.walkCycle) * 0.5;
+                
+                this.armL.rotation.x = swing;
+                this.armR.rotation.x = -swing;
+                this.legL.rotation.x = -swing;
+                this.legR.rotation.x = swing;
             }
 
-            wobble(time, freq) {
-                this.mesh.rotation.z = Math.sin(time * freq) * 0.1;
-                // Wobble scale adjusted
-                this.body.position.y = 0.75 + Math.abs(Math.sin(time * freq * 2)) * 0.1;
+            animateIdle(time) {
+                // Breathing
+                this.torso.scale.set(1 + Math.sin(time*2)*0.02, 1 + Math.cos(time*2)*0.02, 1);
+                this.resetPose();
+            }
+
+            animateJump() {
+                // Hands up!
+                this.armL.rotation.z = Math.PI * 0.8;
+                this.armR.rotation.z = -Math.PI * 0.8;
+                this.legL.rotation.x = -0.2;
+                this.legR.rotation.x = 0.2;
+            }
+
+            resetPose() {
+                this.armL.rotation.set(0,0,0);
+                this.armR.rotation.set(0,0,0);
+                this.legL.rotation.set(0,0,0);
+                this.legR.rotation.set(0,0,0);
+                this.bodyGroup.rotation.x = 0;
+                this.bodyGroup.position.y = 0;
             }
         }
 
@@ -673,22 +701,20 @@
                         reticle.visible = true;
                         reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
                     } else {
-                        // Keep visible if just lost tracking momentarily? No, hide to indicate error.
                         reticle.visible = false;
                     }
                 }
             }
 
-            // --- Game Logic ---
             updateGameLogic(time);
 
             // Shockwaves
             for (let i = shockwaves.length - 1; i >= 0; i--) {
                 const s = shockwaves[i];
                 s.age += delta;
-                const scale = 1 + s.age * 15; // Expand fast
+                const scale = 1 + s.age * 15;
                 s.mesh.scale.set(scale, scale, 1);
-                s.mesh.material.opacity = 0.8 - s.age * 1.5; // Fade out
+                s.mesh.material.opacity = 0.8 - s.age * 1.5;
                 
                 if (s.age > 0.5) {
                     scene.remove(s.mesh);
@@ -701,14 +727,13 @@
                 dwarf.update(delta, time);
             });
 
-            // Collisions (Adjusted for small scale)
+            // Collisions
             if (dwarfs.length > 1) {
                 for(let i=0; i<dwarfs.length; i++) {
                     for(let j=i+1; j<dwarfs.length; j++) {
                         const d1 = dwarfs[i];
                         const d2 = dwarfs[j];
                         const dist = d1.mesh.position.distanceTo(d2.mesh.position);
-                        // Collision distance ~ 7mm
                         if (dist < 0.007) {
                             const pushDir = new THREE.Vector3().subVectors(d1.mesh.position, d2.mesh.position).normalize();
                             d1.mesh.position.add(pushDir.multiplyScalar(0.0005));
@@ -720,7 +745,6 @@
 
             renderer.render(scene, camera);
         }
-
     </script>
 </body>
 </html>
