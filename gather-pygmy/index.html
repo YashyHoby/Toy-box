@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Little People AR (Robust)</title>
+    <title>Little People AR (Interactive)</title>
     <style>
         body {
             margin: 0;
@@ -12,6 +12,8 @@
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
             background-color: #222;
             color: white;
+            user-select: none;
+            -webkit-user-select: none;
         }
         #info {
             position: absolute;
@@ -67,22 +69,36 @@
             outline: none;
             z-index: 999;
             cursor: pointer;
-            display: none; /* Initially hidden until XR support is checked */
+            display: none;
         }
         #ar-button:hover {
             opacity: 1;
+        }
+        #reset-button {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 110;
+            padding: 8px 16px;
+            background: rgba(255, 50, 50, 0.8);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
         }
     </style>
 </head>
 <body>
     <div id="info">
         WebXR AR体験<br>
-        PC: マウス操作 / Mobile: ARボタン<br>
-        (エラー時はここに詳細が出ます)
+        床を認識すると自動で小人が出現します<br>
+        タップ：衝撃 / 長押し：集合
     </div>
-    <div id="overlay">PC: クリックで配置 / AR: 平面認識後にタップ</div>
+    <div id="overlay">グリッドが表示されれば認識OK</div>
     <div id="debug-console"></div>
     
+    <button id="reset-button">RESET</button>
     <button id="ar-button">Checking WebXR...</button>
 
     <!-- Import Map for Three.js -->
@@ -115,17 +131,40 @@
         let isARActive = false;
 
         const maxDwarfs = 20;
-        const dwarfs = [];
+        let dwarfs = [];
         let attractionPoint = null; 
+        
+        // Interaction State
+        let isPressing = false;
+        let pressStartTime = 0;
+        const LONG_PRESS_THRESHOLD = 300; // ms
+
+        // Effects
+        let shockwaves = [];
 
         // DOM Elements
         const arButton = document.getElementById('ar-button');
+        const resetButton = document.getElementById('reset-button');
         const debugConsole = document.getElementById('debug-console');
         const infoDiv = document.getElementById('info');
 
         init();
         animate();
         initARSupport();
+
+        // --- UI Events ---
+        resetButton.addEventListener('click', () => {
+            // Remove all dwarfs
+            dwarfs.forEach(d => scene.remove(d.mesh));
+            dwarfs = [];
+            
+            // Remove all shockwaves
+            shockwaves.forEach(s => scene.remove(s.mesh));
+            shockwaves = [];
+
+            // Reset interaction
+            attractionPoint = null;
+        });
 
         function showError(msg) {
             console.error(msg);
@@ -134,7 +173,7 @@
             infoDiv.textContent = "エラーが発生しました (詳細は赤枠内)";
         }
 
-        // --- Custom AR Initialization (Better Error Handling) ---
+        // --- Custom AR Initialization ---
         async function initARSupport() {
             if ('xr' in navigator) {
                 try {
@@ -155,7 +194,6 @@
                 }
             } else {
                 arButton.style.display = 'none';
-                // Don't show error immediately on PC, just let them play in PC mode
                 console.log("WebXR not available on this device");
             }
         }
@@ -175,15 +213,18 @@
                 
                 session.addEventListener('end', onSessionEnd);
                 
-                // Session Started
                 isARActive = true;
                 arButton.style.display = 'none';
+                resetButton.style.display = 'none'; // Hide reset in AR (or keep if desired, usually overlaid)
+                // Actually keep reset button but style it for AR? Let's keep it visible.
+                resetButton.style.display = 'block'; 
+                
                 debugGrid.visible = false;
                 controls.enabled = false;
-                infoDiv.innerHTML = "床を映してスキャンしてください。<br>リングが出たらタップ！";
+                infoDiv.innerHTML = "床をスキャン中...<br>グリッドが出たら自動で出現します";
                 
             } catch (e) {
-                showError("AR起動エラー:\n" + e.message + "\n\n※このプレビュー画面(iframe)ではブロックされることがあります。\n別タブで開くか、HTTPS環境で実行してください。");
+                showError("AR起動エラー:\n" + e.message + "\n\n※このプレビュー画面(iframe)ではブロックされることがあります。");
             }
         }
 
@@ -197,6 +238,7 @@
             infoDiv.innerHTML = "WebXR AR体験<br>PC: マウス操作 / Mobile: ARボタン";
             hitTestSource = null;
             hitTestSourceRequested = false;
+            reticle.visible = false;
         }
 
         function init() {
@@ -208,6 +250,7 @@
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
             camera.position.set(0, 1.6, 2);
 
+            // Lighting
             const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
             hemisphereLight.position.set(0.5, 1, 0.25);
             scene.add(hemisphereLight);
@@ -240,18 +283,42 @@
             raycaster = new THREE.Raycaster();
             mouse = new THREE.Vector2();
 
+            // PC Events
             window.addEventListener('pointermove', onPointerMove);
             window.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('pointerup', onPointerUp);
 
             // --- AR Controller ---
             controller = renderer.xr.getController(0);
-            controller.addEventListener('select', onSelectAR);
+            controller.addEventListener('selectstart', onSelectStart);
+            controller.addEventListener('selectend', onSelectEnd);
             scene.add(controller);
 
-            // Reticle
-            const ringGeometry = new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2);
-            const ringMaterial = new THREE.MeshBasicMaterial();
-            reticle = new THREE.Mesh(ringGeometry, ringMaterial);
+            // --- Reticle (Scanning Grid) ---
+            // Use a larger GridHelper to represent the detected plane mesh
+            reticle = new THREE.Group();
+            
+            // Core Ring
+            const ringMesh = new THREE.Mesh(
+                new THREE.RingGeometry(0.1, 0.12, 32).rotateX(-Math.PI / 2),
+                new THREE.MeshBasicMaterial({ color: 0x00ffff })
+            );
+            reticle.add(ringMesh);
+
+            // Large Grid (Visual Feedback for "Plane")
+            const gridHelper = new THREE.GridHelper(2, 10, 0x00ffff, 0x00aaaa);
+            // Make grid slightly transparent
+            gridHelper.material.transparent = true;
+            gridHelper.material.opacity = 0.3;
+            reticle.add(gridHelper);
+
+            // Pulsing dot center
+            const dot = new THREE.Mesh(
+                new THREE.CircleGeometry(0.02, 16).rotateX(-Math.PI/2),
+                new THREE.MeshBasicMaterial({ color: 0xffffff })
+            );
+            reticle.add(dot);
+            
             reticle.matrixAutoUpdate = false;
             reticle.visible = false;
             scene.add(reticle);
@@ -259,69 +326,136 @@
             window.addEventListener('resize', onWindowResize);
         }
 
-        // --- Interaction Logic (Same as before) ---
+        // --- Interaction Logic ---
 
         function onPointerMove(event) {
             if (isARActive) return;
-
             mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
             mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
+            
             raycaster.setFromCamera(mouse, camera);
             const intersects = raycaster.intersectObject(debugPlane);
-
             if (intersects.length > 0) {
                 reticle.visible = true;
                 reticle.position.copy(intersects[0].point);
-                reticle.rotation.set(0, 0, 0);
+                reticle.rotation.set(0,0,0);
                 reticle.updateMatrix();
             } else {
                 reticle.visible = false;
             }
         }
 
-        function onPointerDown(event) {
-            if (isARActive) return;
-            handleInteraction(reticle.position);
+        // --- Unified Input Handling (PC & AR) ---
+
+        function onPointerDown() {
+            if (isARActive) return; // Handled by selectstart
+            handlePressStart();
         }
 
-        function onSelectAR() {
-            if (reticle.visible) {
-                const position = new THREE.Vector3();
-                position.setFromMatrixPosition(reticle.matrix);
-                handleInteraction(position);
+        function onPointerUp() {
+            if (isARActive) return; // Handled by selectend
+            handlePressEnd();
+        }
+
+        function onSelectStart() {
+            handlePressStart();
+        }
+
+        function onSelectEnd() {
+            handlePressEnd();
+        }
+
+        function handlePressStart() {
+            isPressing = true;
+            pressStartTime = Date.now();
+        }
+
+        function handlePressEnd() {
+            isPressing = false;
+            const duration = Date.now() - pressStartTime;
+            attractionPoint = null; // Stop gathering
+
+            if (duration < LONG_PRESS_THRESHOLD) {
+                // Short Tap: Trigger Shockwave
+                triggerShockwave();
             }
         }
 
-        function handleInteraction(spawnPosition) {
+        function triggerShockwave() {
             if (!reticle.visible) return;
 
-            const clickedDwarf = dwarfs.find(d => d.mesh.position.distanceTo(spawnPosition) < 0.3);
+            // 1. Get position from reticle
+            const center = new THREE.Vector3();
+            center.setFromMatrixPosition(reticle.matrix);
 
-            if (clickedDwarf) {
-                clickedDwarf.jump();
-                return;
+            // 2. Visual Effect
+            createShockwaveEffect(center);
+
+            // 3. Physics (Jump dwarfs)
+            dwarfs.forEach(dwarf => {
+                const dist = dwarf.mesh.position.distanceTo(center);
+                if (dist < 1.5) { // Radius of impact
+                    // Calculate force direction (away and up)
+                    const dir = new THREE.Vector3().subVectors(dwarf.mesh.position, center).normalize();
+                    dir.y = 0.5; // Upward bias
+                    
+                    // Force strength depends on distance
+                    const force = (1.5 - dist) * 4; 
+                    
+                    dwarf.applyForce(force);
+                }
+            });
+        }
+
+        function createShockwaveEffect(position) {
+            const geometry = new THREE.RingGeometry(0.1, 0.2, 32).rotateX(-Math.PI/2);
+            const material = new THREE.MeshBasicMaterial({ 
+                color: 0xffffff, 
+                transparent: true, 
+                opacity: 0.8,
+                side: THREE.DoubleSide
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.position.copy(position);
+            mesh.position.y += 0.02; // Just above ground
+            
+            scene.add(mesh);
+            shockwaves.push({ mesh, age: 0 });
+        }
+
+        // --- Auto Spawning & Logic ---
+        let lastSpawnTime = 0;
+
+        function updateGameLogic(time) {
+            // 1. Auto Spawn
+            if (reticle.visible && dwarfs.length < maxDwarfs) {
+                // Spawn roughly every 0.5 seconds if conditions met
+                if (time - lastSpawnTime > 0.5) {
+                    if (Math.random() < 0.3) { // 30% chance per check
+                        const center = new THREE.Vector3();
+                        center.setFromMatrixPosition(reticle.matrix);
+                        
+                        // Random offset within the grid
+                        const angle = Math.random() * Math.PI * 2;
+                        const dist = Math.random() * 0.8;
+                        center.x += Math.cos(angle) * dist;
+                        center.z += Math.sin(angle) * dist;
+
+                        const dwarf = new Dwarf(center);
+                        dwarfs.push(dwarf);
+                        lastSpawnTime = time;
+                    }
+                }
             }
 
-            if (dwarfs.length < maxDwarfs) {
-                const dwarf = new Dwarf(spawnPosition);
-                dwarfs.push(dwarf);
-            } else {
-                attractionPoint = spawnPosition.clone();
-                const marker = new THREE.Mesh(
-                    new THREE.RingGeometry(0.3, 0.35, 32).rotateX(-Math.PI/2),
-                    new THREE.MeshBasicMaterial({ color: 0xffff00, opacity: 0.5, transparent: true })
-                );
-                marker.position.copy(spawnPosition);
-                marker.position.y += 0.01;
-                scene.add(marker);
-                
-                setTimeout(() => { 
-                    attractionPoint = null; 
-                    if(marker.parent) marker.parent.remove(marker);
-                }, 5000);
+            // 2. Attraction Logic (Long Press)
+            if (isPressing && reticle.visible) {
+                const target = new THREE.Vector3();
+                target.setFromMatrixPosition(reticle.matrix);
+                attractionPoint = target;
             }
         }
+
 
         // --- Dwarf Class ---
         class Dwarf {
@@ -332,6 +466,7 @@
                 const scale = 0.05 + (Math.random() * 0.02); 
                 this.mesh.scale.set(scale, scale, scale);
 
+                // Simple geometry
                 const bodyGeo = new THREE.CapsuleGeometry(1, 1.5, 4, 8);
                 const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
                 this.body = new THREE.Mesh(bodyGeo, bodyMat);
@@ -343,46 +478,69 @@
                 this.head.position.y = 1.6;
                 this.mesh.add(this.head);
 
-                const eyeGeo = new THREE.SphereGeometry(0.1, 8, 8);
-                const eyeMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
-                const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
-                leftEye.position.set(-0.25, 1.7, 0.6);
-                this.mesh.add(leftEye);
-                const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
-                rightEye.position.set(0.25, 1.7, 0.6);
-                this.mesh.add(rightEye);
+                // Pop animation on spawn
+                this.mesh.scale.set(0,0,0);
+                this.targetScale = scale;
+                this.spawnAnim = 0;
 
                 scene.add(this.mesh);
 
                 this.state = 'IDLE';
                 this.stateTimer = 0;
                 this.destination = null;
-                this.jumpForce = 0;
+                this.velocity = new THREE.Vector3(); // For physics
                 this.baseY = position.y; 
                 this.speed = 0.5 + Math.random() * 0.5;
                 this.isSleepy = Math.random() > 0.7;
             }
 
+            applyForce(force) {
+                this.velocity.y += force;
+                // Add some random horizontal scatter
+                this.velocity.x += (Math.random() - 0.5) * force;
+                this.velocity.z += (Math.random() - 0.5) * force;
+                this.state = 'JUMP';
+            }
+
             update(delta, time) {
                 this.stateTimer -= delta;
 
-                if (this.jumpForce > 0 || this.mesh.position.y > this.baseY) {
-                    this.mesh.position.y += this.jumpForce * delta;
-                    this.jumpForce -= 9.8 * delta;
-                    if (this.mesh.position.y <= this.baseY) {
-                        this.mesh.position.y = this.baseY;
-                        this.jumpForce = 0;
-                        this.state = 'IDLE';
-                        this.body.scale.set(1.2, 0.8, 1.2); 
-                    } else {
-                        this.body.scale.set(0.9, 1.1, 0.9); 
-                    }
-                } else {
-                    this.body.scale.lerp(new THREE.Vector3(1,1,1), delta * 5);
+                // Spawn Animation
+                if (this.spawnAnim < 1) {
+                    this.spawnAnim += delta * 3;
+                    const s = Math.min(this.spawnAnim, 1) * this.targetScale;
+                    this.mesh.scale.set(s,s,s);
                 }
 
-                if (this.jumpForce > 0) return;
+                // Physics (Gravity/Velocity)
+                this.velocity.y -= 9.8 * delta; // Gravity
+                
+                // Air resistance
+                this.velocity.x *= 0.95;
+                this.velocity.z *= 0.95;
 
+                // Apply velocity
+                this.mesh.position.add(this.velocity.clone().multiplyScalar(delta));
+
+                // Ground Collision
+                if (this.mesh.position.y <= this.baseY) {
+                    this.mesh.position.y = this.baseY;
+                    this.velocity.set(0, 0, 0);
+                    
+                    if (this.state === 'JUMP') {
+                        this.state = 'IDLE';
+                        this.body.scale.set(1.2, 0.8, 1.2); // Landing squash
+                    } else {
+                        this.body.scale.lerp(new THREE.Vector3(1,1,1), delta * 5); // Return to normal
+                    }
+                } else {
+                    this.state = 'JUMP'; // In air
+                    this.body.scale.set(0.9, 1.1, 0.9); // Air stretch
+                }
+
+                if (this.state === 'JUMP') return;
+
+                // AI Logic Override
                 if (attractionPoint) {
                     this.state = 'GATHER';
                 } else if (this.state === 'GATHER' && !attractionPoint) {
@@ -427,7 +585,7 @@
                             if (this.mesh.position.distanceTo(target) < 0.5) {
                                 this.wobble(time, 5); 
                             }
-                            this.moveTo(target, delta, this.speed * 2.5);
+                            this.moveTo(target, delta, this.speed * 2.0); // Gather speed
                         }
                         break;
 
@@ -437,7 +595,7 @@
                         if (this.stateTimer <= 0) {
                             this.mesh.rotation.x = 0;
                             this.enterState('IDLE');
-                            this.jumpForce = 2;
+                            this.velocity.y = 1.5; // Jump wake up
                         }
                         break;
                 }
@@ -462,12 +620,6 @@
             wobble(time, freq) {
                 this.mesh.rotation.z = Math.sin(time * freq) * 0.1;
                 this.body.position.y = 0.75 + Math.abs(Math.sin(time * freq * 2)) * 0.1;
-            }
-
-            jump() {
-                if (this.state === 'SLEEP') this.mesh.rotation.x = 0;
-                this.jumpForce = 3 + Math.random() * 2;
-                this.state = 'JUMP';
             }
         }
 
@@ -494,9 +646,7 @@
                         session.requestHitTestSource({ space: refSpace }).then(function (source) {
                             hitTestSource = source;
                         });
-                    }).catch(err => {
-                        console.warn("Hit test request failed", err);
-                    });
+                    }).catch(err => console.warn("Hit test failed", err));
                     session.addEventListener('end', function () {
                         hitTestSourceRequested = false;
                         hitTestSource = null;
@@ -511,15 +661,35 @@
                         reticle.visible = true;
                         reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
                     } else {
+                        // Keep visible if just lost tracking momentarily? No, hide to indicate error.
                         reticle.visible = false;
                     }
                 }
             }
 
+            // --- Game Logic ---
+            updateGameLogic(time);
+
+            // Shockwaves
+            for (let i = shockwaves.length - 1; i >= 0; i--) {
+                const s = shockwaves[i];
+                s.age += delta;
+                const scale = 1 + s.age * 15; // Expand fast
+                s.mesh.scale.set(scale, scale, 1);
+                s.mesh.material.opacity = 0.8 - s.age * 1.5; // Fade out
+                
+                if (s.age > 0.5) {
+                    scene.remove(s.mesh);
+                    shockwaves.splice(i, 1);
+                }
+            }
+
+            // Dwarfs
             dwarfs.forEach(dwarf => {
                 dwarf.update(delta, time);
             });
 
+            // Collisions
             if (dwarfs.length > 1) {
                 for(let i=0; i<dwarfs.length; i++) {
                     for(let j=i+1; j<dwarfs.length; j++) {
