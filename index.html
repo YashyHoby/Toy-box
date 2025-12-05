@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Little People AR (Robust)</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #222;
+            color: white;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            pointer-events: none;
+            text-shadow: 1px 1px 2px black;
+            font-size: 14px;
+            background: rgba(0,0,0,0.3);
+            padding: 10px 0;
+        }
+        #overlay {
+            position: absolute;
+            bottom: 30px;
+            left: 0;
+            width: 100%;
+            text-align: center;
+            z-index: 100;
+            pointer-events: none;
+            color: #ccc;
+            font-size: 12px;
+        }
+        #debug-console {
+            position: absolute;
+            top: 60px;
+            left: 10px;
+            right: 10px;
+            z-index: 102;
+            background: rgba(255, 0, 0, 0.7);
+            color: white;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            display: none;
+            pointer-events: none;
+            white-space: pre-wrap;
+        }
+        #ar-button {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            padding: 12px 24px;
+            border: 1px solid white;
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.5);
+            color: white;
+            font: normal 13px sans-serif;
+            text-align: center;
+            opacity: 0.5;
+            outline: none;
+            z-index: 999;
+            cursor: pointer;
+            display: none; /* Initially hidden until XR support is checked */
+        }
+        #ar-button:hover {
+            opacity: 1;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        WebXR AR体験<br>
+        PC: マウス操作 / Mobile: ARボタン<br>
+        (エラー時はここに詳細が出ます)
+    </div>
+    <div id="overlay">PC: クリックで配置 / AR: 平面認識後にタップ</div>
+    <div id="debug-console"></div>
+    
+    <button id="ar-button">Checking WebXR...</button>
+
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        let container;
+        let camera, scene, renderer;
+        let controller;
+        let reticle;
+        let hitTestSource = null;
+        let hitTestSourceRequested = false;
+
+        // PC Debugging Tools
+        let controls;
+        let debugGrid;
+        let debugPlane;
+        let raycaster;
+        let mouse;
+        let isARActive = false;
+
+        const maxDwarfs = 20;
+        const dwarfs = [];
+        let attractionPoint = null; 
+
+        // DOM Elements
+        const arButton = document.getElementById('ar-button');
+        const debugConsole = document.getElementById('debug-console');
+        const infoDiv = document.getElementById('info');
+
+        init();
+        animate();
+        initARSupport();
+
+        function showError(msg) {
+            console.error(msg);
+            debugConsole.style.display = 'block';
+            debugConsole.textContent = "Error: " + msg;
+            infoDiv.textContent = "エラーが発生しました (詳細は赤枠内)";
+        }
+
+        // --- Custom AR Initialization (Better Error Handling) ---
+        async function initARSupport() {
+            if ('xr' in navigator) {
+                try {
+                    const isSupported = await navigator.xr.isSessionSupported('immersive-ar');
+                    if (isSupported) {
+                        arButton.style.display = 'block';
+                        arButton.textContent = 'START AR';
+                        arButton.style.opacity = '1';
+                        arButton.addEventListener('click', onARButtonClick);
+                    } else {
+                        arButton.style.display = 'block';
+                        arButton.textContent = 'AR NOT SUPPORTED';
+                        arButton.disabled = true;
+                        showError("お使いのデバイス/ブラウザはWebXR ARに対応していません。\n(Chrome on Android推奨)");
+                    }
+                } catch (e) {
+                    showError("WebXR Check Error: " + e.message);
+                }
+            } else {
+                arButton.style.display = 'none';
+                // Don't show error immediately on PC, just let them play in PC mode
+                console.log("WebXR not available on this device");
+            }
+        }
+
+        async function onARButtonClick() {
+            if (!navigator.xr) return;
+            
+            try {
+                const session = await navigator.xr.requestSession('immersive-ar', {
+                    requiredFeatures: ['hit-test'],
+                    optionalFeatures: ['dom-overlay'],
+                    domOverlay: { root: document.body }
+                });
+                
+                renderer.xr.setReferenceSpaceType('local');
+                renderer.xr.setSession(session);
+                
+                session.addEventListener('end', onSessionEnd);
+                
+                // Session Started
+                isARActive = true;
+                arButton.style.display = 'none';
+                debugGrid.visible = false;
+                controls.enabled = false;
+                infoDiv.innerHTML = "床を映してスキャンしてください。<br>リングが出たらタップ！";
+                
+            } catch (e) {
+                showError("AR起動エラー:\n" + e.message + "\n\n※このプレビュー画面(iframe)ではブロックされることがあります。\n別タブで開くか、HTTPS環境で実行してください。");
+            }
+        }
+
+        function onSessionEnd() {
+            isARActive = false;
+            arButton.style.display = 'block';
+            debugGrid.visible = true;
+            controls.enabled = true;
+            camera.position.set(0, 1.6, 2);
+            controls.reset();
+            infoDiv.innerHTML = "WebXR AR体験<br>PC: マウス操作 / Mobile: ARボタン";
+            hitTestSource = null;
+            hitTestSourceRequested = false;
+        }
+
+        function init() {
+            container = document.createElement('div');
+            document.body.appendChild(container);
+
+            scene = new THREE.Scene();
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+            camera.position.set(0, 1.6, 2);
+
+            const hemisphereLight = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            hemisphereLight.position.set(0.5, 1, 0.25);
+            scene.add(hemisphereLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(0, 10, 0);
+            directionalLight.castShadow = true;
+            scene.add(directionalLight);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.xr.enabled = true;
+            container.appendChild(renderer.domElement);
+
+            // --- PC Mode Setup ---
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 0, 0);
+            controls.update();
+
+            debugGrid = new THREE.GridHelper(10, 20);
+            scene.add(debugGrid);
+
+            const planeGeo = new THREE.PlaneGeometry(100, 100);
+            const planeMat = new THREE.MeshBasicMaterial({ visible: false });
+            debugPlane = new THREE.Mesh(planeGeo, planeMat);
+            debugPlane.rotation.x = -Math.PI / 2;
+            scene.add(debugPlane);
+
+            raycaster = new THREE.Raycaster();
+            mouse = new THREE.Vector2();
+
+            window.addEventListener('pointermove', onPointerMove);
+            window.addEventListener('pointerdown', onPointerDown);
+
+            // --- AR Controller ---
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelectAR);
+            scene.add(controller);
+
+            // Reticle
+            const ringGeometry = new THREE.RingGeometry(0.15, 0.2, 32).rotateX(-Math.PI / 2);
+            const ringMaterial = new THREE.MeshBasicMaterial();
+            reticle = new THREE.Mesh(ringGeometry, ringMaterial);
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- Interaction Logic (Same as before) ---
+
+        function onPointerMove(event) {
+            if (isARActive) return;
+
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            const intersects = raycaster.intersectObject(debugPlane);
+
+            if (intersects.length > 0) {
+                reticle.visible = true;
+                reticle.position.copy(intersects[0].point);
+                reticle.rotation.set(0, 0, 0);
+                reticle.updateMatrix();
+            } else {
+                reticle.visible = false;
+            }
+        }
+
+        function onPointerDown(event) {
+            if (isARActive) return;
+            handleInteraction(reticle.position);
+        }
+
+        function onSelectAR() {
+            if (reticle.visible) {
+                const position = new THREE.Vector3();
+                position.setFromMatrixPosition(reticle.matrix);
+                handleInteraction(position);
+            }
+        }
+
+        function handleInteraction(spawnPosition) {
+            if (!reticle.visible) return;
+
+            const clickedDwarf = dwarfs.find(d => d.mesh.position.distanceTo(spawnPosition) < 0.3);
+
+            if (clickedDwarf) {
+                clickedDwarf.jump();
+                return;
+            }
+
+            if (dwarfs.length < maxDwarfs) {
+                const dwarf = new Dwarf(spawnPosition);
+                dwarfs.push(dwarf);
+            } else {
+                attractionPoint = spawnPosition.clone();
+                const marker = new THREE.Mesh(
+                    new THREE.RingGeometry(0.3, 0.35, 32).rotateX(-Math.PI/2),
+                    new THREE.MeshBasicMaterial({ color: 0xffff00, opacity: 0.5, transparent: true })
+                );
+                marker.position.copy(spawnPosition);
+                marker.position.y += 0.01;
+                scene.add(marker);
+                
+                setTimeout(() => { 
+                    attractionPoint = null; 
+                    if(marker.parent) marker.parent.remove(marker);
+                }, 5000);
+            }
+        }
+
+        // --- Dwarf Class ---
+        class Dwarf {
+            constructor(position) {
+                this.mesh = new THREE.Group();
+                this.mesh.position.copy(position);
+                
+                const scale = 0.05 + (Math.random() * 0.02); 
+                this.mesh.scale.set(scale, scale, scale);
+
+                const bodyGeo = new THREE.CapsuleGeometry(1, 1.5, 4, 8);
+                const bodyMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.3 });
+                this.body = new THREE.Mesh(bodyGeo, bodyMat);
+                this.body.position.y = 0.75;
+                this.mesh.add(this.body);
+
+                const headGeo = new THREE.SphereGeometry(0.7, 16, 16);
+                this.head = new THREE.Mesh(headGeo, bodyMat);
+                this.head.position.y = 1.6;
+                this.mesh.add(this.head);
+
+                const eyeGeo = new THREE.SphereGeometry(0.1, 8, 8);
+                const eyeMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
+                const leftEye = new THREE.Mesh(eyeGeo, eyeMat);
+                leftEye.position.set(-0.25, 1.7, 0.6);
+                this.mesh.add(leftEye);
+                const rightEye = new THREE.Mesh(eyeGeo, eyeMat);
+                rightEye.position.set(0.25, 1.7, 0.6);
+                this.mesh.add(rightEye);
+
+                scene.add(this.mesh);
+
+                this.state = 'IDLE';
+                this.stateTimer = 0;
+                this.destination = null;
+                this.jumpForce = 0;
+                this.baseY = position.y; 
+                this.speed = 0.5 + Math.random() * 0.5;
+                this.isSleepy = Math.random() > 0.7;
+            }
+
+            update(delta, time) {
+                this.stateTimer -= delta;
+
+                if (this.jumpForce > 0 || this.mesh.position.y > this.baseY) {
+                    this.mesh.position.y += this.jumpForce * delta;
+                    this.jumpForce -= 9.8 * delta;
+                    if (this.mesh.position.y <= this.baseY) {
+                        this.mesh.position.y = this.baseY;
+                        this.jumpForce = 0;
+                        this.state = 'IDLE';
+                        this.body.scale.set(1.2, 0.8, 1.2); 
+                    } else {
+                        this.body.scale.set(0.9, 1.1, 0.9); 
+                    }
+                } else {
+                    this.body.scale.lerp(new THREE.Vector3(1,1,1), delta * 5);
+                }
+
+                if (this.jumpForce > 0) return;
+
+                if (attractionPoint) {
+                    this.state = 'GATHER';
+                } else if (this.state === 'GATHER' && !attractionPoint) {
+                    this.state = 'IDLE';
+                }
+
+                switch (this.state) {
+                    case 'IDLE':
+                        if (this.stateTimer <= 0) {
+                            const r = Math.random();
+                            if (r < 0.1 && this.isSleepy) this.enterState('SLEEP');
+                            else if (r < 0.4) this.enterState('MOVE');
+                            else {
+                                this.mesh.rotation.y += (Math.random() - 0.5) * 2;
+                                this.stateTimer = 1 + Math.random() * 2;
+                            }
+                        }
+                        this.wobble(time, 0.5);
+                        break;
+
+                    case 'MOVE':
+                        if (!this.destination) {
+                            const angle = Math.random() * Math.PI * 2;
+                            const dist = 0.5 + Math.random() * 1.5;
+                            this.destination = new THREE.Vector3(
+                                this.mesh.position.x + Math.cos(angle) * dist,
+                                this.baseY,
+                                this.mesh.position.z + Math.sin(angle) * dist
+                            );
+                            this.stateTimer = 2 + Math.random() * 3;
+                        }
+                        this.moveTo(this.destination, delta, this.speed);
+                        if (this.mesh.position.distanceTo(this.destination) < 0.05 || this.stateTimer <= 0) {
+                            this.destination = null;
+                            this.enterState('IDLE');
+                        }
+                        break;
+                    
+                    case 'GATHER':
+                        if (attractionPoint) {
+                            let target = attractionPoint.clone();
+                            if (this.mesh.position.distanceTo(target) < 0.5) {
+                                this.wobble(time, 5); 
+                            }
+                            this.moveTo(target, delta, this.speed * 2.5);
+                        }
+                        break;
+
+                    case 'SLEEP':
+                        this.mesh.rotation.x = THREE.MathUtils.lerp(this.mesh.rotation.x, -Math.PI / 2, delta * 2);
+                        this.mesh.position.y = this.baseY - 0.02 * this.mesh.scale.x;
+                        if (this.stateTimer <= 0) {
+                            this.mesh.rotation.x = 0;
+                            this.enterState('IDLE');
+                            this.jumpForce = 2;
+                        }
+                        break;
+                }
+            }
+
+            enterState(newState) {
+                this.state = newState;
+                if (newState === 'SLEEP') this.stateTimer = 5 + Math.random() * 10;
+                else if (newState === 'MOVE') this.stateTimer = 5;
+                else this.stateTimer = 2;
+                if (newState !== 'SLEEP') this.mesh.rotation.x = 0;
+            }
+
+            moveTo(target, delta, speed) {
+                const lookTarget = new THREE.Vector3(target.x, this.mesh.position.y, target.z);
+                this.mesh.lookAt(lookTarget);
+                const dir = new THREE.Vector3().subVectors(target, this.mesh.position).normalize();
+                this.mesh.position.add(dir.multiplyScalar(speed * delta * 0.2));
+                this.wobble(Date.now() / 1000, 15 * speed);
+            }
+
+            wobble(time, freq) {
+                this.mesh.rotation.z = Math.sin(time * freq) * 0.1;
+                this.body.position.y = 0.75 + Math.abs(Math.sin(time * freq * 2)) * 0.1;
+            }
+
+            jump() {
+                if (this.state === 'SLEEP') this.mesh.rotation.x = 0;
+                this.jumpForce = 3 + Math.random() * 2;
+                this.state = 'JUMP';
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            renderer.setAnimationLoop(render);
+        }
+
+        function render(timestamp, frame) {
+            const delta = 0.016; 
+            const time = timestamp / 1000;
+
+            if (isARActive && frame) {
+                const referenceSpace = renderer.xr.getReferenceSpace();
+                const session = renderer.xr.getSession();
+
+                if (hitTestSourceRequested === false) {
+                    session.requestReferenceSpace('viewer').then(function (refSpace) {
+                        session.requestHitTestSource({ space: refSpace }).then(function (source) {
+                            hitTestSource = source;
+                        });
+                    }).catch(err => {
+                        console.warn("Hit test request failed", err);
+                    });
+                    session.addEventListener('end', function () {
+                        hitTestSourceRequested = false;
+                        hitTestSource = null;
+                    });
+                    hitTestSourceRequested = true;
+                }
+
+                if (hitTestSource) {
+                    const hitTestResults = frame.getHitTestResults(hitTestSource);
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        reticle.visible = true;
+                        reticle.matrix.fromArray(hit.getPose(referenceSpace).transform.matrix);
+                    } else {
+                        reticle.visible = false;
+                    }
+                }
+            }
+
+            dwarfs.forEach(dwarf => {
+                dwarf.update(delta, time);
+            });
+
+            if (dwarfs.length > 1) {
+                for(let i=0; i<dwarfs.length; i++) {
+                    for(let j=i+1; j<dwarfs.length; j++) {
+                        const d1 = dwarfs[i];
+                        const d2 = dwarfs[j];
+                        const dist = d1.mesh.position.distanceTo(d2.mesh.position);
+                        if (dist < 0.15) {
+                            const pushDir = new THREE.Vector3().subVectors(d1.mesh.position, d2.mesh.position).normalize();
+                            d1.mesh.position.add(pushDir.multiplyScalar(0.005));
+                            d2.mesh.position.add(pushDir.multiplyScalar(-0.005));
+                        }
+                    }
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+    </script>
+</body>
+</html>
